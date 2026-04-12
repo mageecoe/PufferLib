@@ -17,7 +17,7 @@ int main() {
     env.terminals = (float*)calloc(1, sizeof(float));
 
     int logit_sizes[1] = {2};
-    Weights* weights = load_weights("resources/bluffpig/puffer_bluffpig_weights.bin", 133123);
+    Weights* weights = load_weights("resources/bluffpig/puffer_bluffpig_weights.bin");
     LinearLSTM* net = make_linearlstm(weights, 1, 4, logit_sizes, 1); // 4 obs, 2 actions
 
     c_reset(&env);
