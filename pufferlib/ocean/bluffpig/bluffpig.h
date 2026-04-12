@@ -26,7 +26,7 @@ typedef struct {
 // Recommended that you name it the same as the env file
 typedef struct {
     Log log;
-    float* observations; // [agent_score, opponent_score, turn_score, last_roll]
+    float* observations; // [agent_score, opponent_score, turn_score, last_roll, current_player]
     int* actions; // 0=roll, 1=hold
     float* rewards;
     unsigned char* terminals; // Required. We don't yet have truncations as
@@ -36,7 +36,9 @@ typedef struct {
   int turn_score;  // points accumulated this turn, forfeited on a 1
   int current_player; // 0=agent, 1=opponent
   int last_roll;  // last die result (1-6), part of the observation
+  int n_rolls_turn; // number of rolls this turn.
   int tick;       // step counter for episode length logging.
+  int wins[2];    // number of wins for each player.
 } Bluffpig;
 
 void add_log(Bluffpig* env) {
@@ -48,7 +50,9 @@ void add_log(Bluffpig* env) {
 }
 
 // Required function
-void c_reset(Bluffpig*     env->turn_score = 0;
+void c_reset(Bluffpig* env) {
+    env->turn_score = 0;
+    env->n_rolls_turn = 0;
     env->scores[0] = env->scores[1] = 0;
     env->tick = 0;
     env->current_player = rand() % 2;
@@ -69,28 +73,36 @@ void c_step(Bluffpig* env) {
 
     if(env->current_player == 0){
       // Agent strategy is given by the policy network.
-      if(env->last_roll == 1){
-        env->turn_score = 0;
-        env->current_player = (env->current_player + 1) % 2;
-        goto cleanup;
-      }
-      env->turn_score += env->last_roll;
       if (action == HOLD) {  // Hold
         env->scores[0] += env->turn_score;
         env->current_player = (env->current_player + 1) % 2;
         env->turn_score = 0;
+        env->n_rolls_turn = 0;
       }
-    }
-    else {
-      // Opponent strategy
-      while(env->turn_score <= 20 || env->turn_score + env->last_roll < env->target_score){
+      else if (action == ROLL) {
+        env->last_roll = (rand() % 6) + 1;
+        env->n_rolls_turn += 1;
         if(env->last_roll == 1){
           env->turn_score = 0;
           env->current_player = (env->current_player + 1) % 2;
           goto cleanup;
         }
         env->turn_score += env->last_roll;
+      }
+    }
+
+    if(env->current_player == 1){
+      // Opponent strategy
+      while(env->turn_score <= 20 && env->scores[1] + env->turn_score < env->target_score){
         env->last_roll = (rand() % 6) + 1;
+        if(env->last_roll == 1){
+          env->turn_score = 0;
+          env->n_rolls_turn = 0;
+          env->current_player = (env->current_player + 1) % 2;
+          goto cleanup;
+        }
+        env->turn_score += env->last_roll;
+        env->n_rolls_turn += 1;
       }
       env->scores[1] += env->turn_score;
       env->current_player = (env->current_player + 1) % 2;
@@ -99,9 +111,11 @@ void c_step(Bluffpig* env) {
 
     if(env->scores[0] >= env->target_score){
       env->rewards[0] = 1;
+      env->wins[0] += 1;
     }
-    if(env->scores[1] >= env->target_score){
+    else if(env->scores[1] >= env->target_score){
       env->rewards[0] = -1;
+      env->wins[1] += 1;
     }
 
     if(env->scores[0] >= env->target_score ||
@@ -112,7 +126,6 @@ void c_step(Bluffpig* env) {
     }
 
  cleanup:
-    env->last_roll = (rand() % 6) + 1;
     env->observations[0] = env->scores[0] / (float)env->target_score;
     env->observations[1] = env->scores[1] / (float)env->target_score;
     env->observations[2] = env->turn_score / (float)env->target_score;
@@ -122,7 +135,7 @@ void c_step(Bluffpig* env) {
 // Required function. Should handle creating the client on first call
 void c_render(Bluffpig* env) {
     if (!IsWindowReady()) {
-        InitWindow(400, 200, "PufferLib Bluffpig");
+        InitWindow(400, 260, "PufferLib Bluffpig");
         SetTargetFPS(5);
     }
 
@@ -138,6 +151,8 @@ void c_render(Bluffpig* env) {
     DrawText(TextFormat("Turn score:     %d", env->turn_score), 20, 80,  20, (Color){187, 187, 0, 255});
     DrawText(TextFormat("Last roll:      %d", env->last_roll),  20, 110, 20, (Color){187, 187, 187, 255});
     DrawText(TextFormat("Turn: %s", env->current_player == 0 ? "Agent" : "Opponent"), 20, 140, 20, WHITE);
+    DrawText(TextFormat("Num rolls:      %d", env->n_rolls_turn), 20, 170, 20, WHITE);
+    DrawText(TextFormat("Wins: %d - %d", env->wins[0], env->wins[1]), 20, 200, 20, WHITE);
 
     EndDrawing();
 }

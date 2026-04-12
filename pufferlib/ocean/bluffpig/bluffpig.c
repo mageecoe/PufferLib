@@ -7,6 +7,7 @@
  */
 
 #include "bluffpig.h"
+#include "puffernet.h"
 
 int main() {
     Bluffpig env = {.target_score = 100};
@@ -15,15 +16,31 @@ int main() {
     env.rewards = (float*)calloc(1, sizeof(float));
     env.terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
 
+    int logit_sizes[1] = {2};
+    Weights* weights = load_weights("resources/bluffpig/puffer_bluffpig_weights.bin", 133123);
+    LinearLSTM* net = make_linearlstm(weights, 1, 4, logit_sizes, 1); // 4 obs,
+                                                                      // 2 actions
+
     c_reset(&env);
     c_render(&env);
     while (!WindowShouldClose()) {
-      if (IsKeyPressed(KEY_R)){
-        env.actions[0] = 0;
-        c_step(&env);
+      if(env.current_player == 0){
+        if (IsKeyDown(KEY_LEFT_SHIFT)) {
+          if (IsKeyPressed(KEY_R)){
+            env.actions[0] = 0;
+            c_step(&env);
+          }
+          if (IsKeyPressed(KEY_H)){
+            env.actions[0] = 1;
+            c_step(&env);
+          }
+        }
+        else {
+          forward_linearlstm(net, env.observations, env.actions);
+          c_step(&env);
+        }
       }
-      if (IsKeyPressed(KEY_H)){
-        env.actions[0] = 1;
+      else {
         c_step(&env);
       }
       c_render(&env);
