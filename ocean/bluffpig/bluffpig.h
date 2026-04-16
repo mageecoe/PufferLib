@@ -30,6 +30,8 @@ typedef struct {
     float* actions; // 0=roll, 1=hold
     float* rewards;
     float* terminals; // Required
+    unsigned int rng;
+    int num_agents;
     int target_score; // winning threshold, typically 100
     int scores[2];  // total banked scores: [agent, opponent]
     int turn_score;  // points accumulated this turn, forfeited on a 1
@@ -54,8 +56,8 @@ void c_reset(Bluffpig* env) {
     env->n_rolls_turn = 0;
     env->scores[0] = env->scores[1] = 0;
     env->tick = 0;
-    env->current_player = rand() % 2;
-    env->last_roll = rand() % 6 + 1;
+    env->current_player = rand_r(&env->rng) % 2;
+    env->last_roll = rand_r(&env->rng) % 6 + 1;
     env->observations[0] = env->scores[0] / (float)env->target_score;
     env->observations[1] = env->scores[1] / (float)env->target_score;
     env->observations[2] = env->turn_score / (float)env->target_score;
@@ -79,7 +81,7 @@ void c_step(Bluffpig* env) {
         env->n_rolls_turn = 0;
       }
       else if (action == ROLL) {
-        env->last_roll = (rand() % 6) + 1;
+        env->last_roll = (rand_r(&env->rng) % 6) + 1;
         env->n_rolls_turn += 1;
         if(env->last_roll == 1){
           env->turn_score = 0;
@@ -93,7 +95,7 @@ void c_step(Bluffpig* env) {
     if(env->current_player == 1){
       // Opponent strategy
       while(env->turn_score <= 20 && env->scores[1] + env->turn_score < env->target_score){
-        env->last_roll = (rand() % 6) + 1;
+        env->last_roll = (rand_r(&env->rng) % 6) + 1;
         if(env->last_roll == 1){
           env->turn_score = 0;
           env->n_rolls_turn = 0;

@@ -8,8 +8,8 @@
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
     env->target_score = dict_get(kwargs, "target_score")->value;
-    c_reset(env);
 }
 
 void my_log(Log* log, Dict* out) {
