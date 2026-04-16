@@ -1,0 +1,1064 @@
+#+TITLE: Learning Reinforcement Learning with PufferLib
+#+AUTHOR: Magnus Nilsson
+#+STARTUP: overview
+#+OPTIONS: toc:2
+
+* Introduction
+
+PufferLib is a high-performance reinforcement learning library by Joseph Suarez,
+described as "the RL library I wish existed during my PhD." It wraps PyTorch and
+handles the boring parts (vectorization, training loops, logging) so you can focus
+on environments and policies.
+
+Key design choices:
+- Policies are plain ~torch.nn.Module~ subclasses — no special base class required
+- Environments are batched from the start: one ~reset()~ call resets /all/ parallel agents
+- The training algorithm is PPO (Proximal Policy Optimization) with V-Trace corrections
+- Native environments (in ~ocean/~) are compiled C code achieving 1M+ steps/second
+
+** RL Core Concepts
+
+Before diving into code, internalize this loop:
+
+#+begin_example
+  observation ──► policy ──► action
+      ▲                         │
+      │                         ▼
+   environment ◄──────── step(action)
+      │
+      └─► reward, done
+#+end_example
+
+- *Agent*: the learner; picks actions based on observations
+- *Environment*: the world; responds to actions with new observations and rewards
+- *Policy*: the agent's brain; a function ~observation → action~
+- *Value function*: estimates expected future reward from a state; used to reduce variance
+- *Episode*: one complete run from reset to termination
+- *Return*: sum of rewards over an episode (often discounted by γ < 1)
+
+** Where PufferLib Fits
+
+| Your responsibility      | PufferLib's responsibility            |
+|--------------------------+---------------------------------------|
+| Define the environment   | Vectorize it across many CPU cores    |
+| Write the policy network | Run the PPO training loop             |
+| Choose hyperparameters   | Compute advantages, losses, gradients |
+| Pick an environment      | Log metrics, checkpoint models        |
+
+* Repository Map
+
+#+begin_example
+PufferLib/
+├── pufferlib/
+│   ├── pufferlib.py      ← PufferEnv base class and wrappers
+│   ├── pufferl.py        ← PuffeRL trainer class, CLI entry point
+│   ├── vector.py         ← Vectorized env runners (Serial, Multiprocessing)
+│   ├── models.py         ← Pre-built policies (Default, Convolutional, LSTM)
+│   ├── emulation.py      ← Adapters for Gymnasium and PettingZoo envs
+│   ├── pytorch.py        ← Utilities: layer_init, sample_logits, dtype helpers
+│   ├── spaces.py         ← Gymnasium space definitions
+│   ├── sweep.py          ← Bayesian hyperparameter optimization
+│   └── config/
+│       ├── default.ini   ← Default hyperparameters for all runs
+│       └── ocean/        ← Per-environment config overrides
+└── pufferlib/ocean/      ← Native high-speed environments (C/Cython)
+    ├── squared/          ← Simplest template environment — read this first
+    ├── snake/            ← Classic snake game
+    ├── cartpole/         ← Classic control task
+    ├── breakout/         ← Atari-style environment
+    ├── tmaze/            ← Memory task requiring LSTM
+    └── ...               ← 40+ more environments
+#+end_example
+
+The file to read when you are confused about anything training-related:
+~pufferlib/pufferl.py~. It is large but well-structured.
+
+* Step 1: Run Your First Training Run
+
+** Installation
+
+The repo includes a pre-created virtual environment at ~.venv/~.
+*Activate it before running any Python or ~puffer~ commands:*
+
+#+begin_src shell
+source .venv/bin/activate
+#+end_src
+
+From the repo root (with the venv active):
+
+#+begin_src shell
+# Install torch first (uv needs it pre-installed for the C/CUDA build step)
+uv pip install torch
+
+# Install PufferLib with all ocean environments compiled
+uv pip install -e . --no-build-isolation
+#+end_src
+
+~--no-build-isolation~ is required because ~setup.py~ imports ~torch~ at build time
+to compile CUDA kernels. With isolation enabled, torch isn't available during the build.
+
+If you have the NVIDIA driver but not the CUDA toolkit (~nvcc~ not found), PyTorch
+will incorrectly detect ~/usr/local/cuda~ and try to build a CUDA extension. Fix this
+by unsetting ~CUDA_HOME~ to force a CPU-only C++ extension build:
+
+#+begin_src shell
+CUDA_HOME="" uv pip install -e . --no-build-isolation
+#+end_src
+
+This only affects the advantage computation kernel — GPU training still works normally.
+To get the full CUDA kernel later, install the toolkit and reinstall:
+
+#+begin_src shell
+sudo apt install nvidia-cuda-toolkit
+uv pip install -e . --no-build-isolation
+#+end_src
+
+To skip compiling ocean environments entirely (if you only want Gymnasium wrappers):
+#+begin_src shell
+NO_OCEAN=1 uv pip install -e . --no-build-isolation
+#+end_src
+
+*** Rebuilding a Single Environment
+
+If you modify an ocean environment's C code, you don't need to rebuild everything.
+Use the per-environment build command instead — it is faster and avoids
+recompiling unrelated environments:
+
+#+begin_src shell
+# Rebuild only breakout (recommended approach)
+python setup.py build_breakout --inplace
+
+# Full rebuild of all environments (slow — avoid unless necessary)
+python setup.py build_ext --inplace
+#+end_src
+
+Always use the venv Python when running ~setup.py~ directly, so the compiled
+~.so~ file targets the correct Python/CUDA version.
+
+** CLI Training
+
+PufferLib exposes a ~puffer~ command. Make sure the venv is active first
+(~source .venv/bin/activate~) — the ~puffer~ binary lives inside it.
+
+#+begin_src shell
+# Train snake for 10M steps (uses GPU by default)
+puffer train puffer_snake
+
+# Train on CPU (useful without a GPU)
+puffer train puffer_snake --train.device cpu
+
+# Evaluate a trained model
+puffer eval puffer_snake --load-model-path experiments/puffer_snake_latest.pt
+
+# See all options
+puffer train puffer_snake --help
+#+end_src
+
+All environment names follow the pattern ~puffer_<envname>~.
+Available ocean environments: snake, breakout, tetris, pacman, cartpole, squared,
+tmaze, memory, battle, connect4, and ~40 more.
+
+** Reading the Dashboard
+
+During training, PufferLib prints a live dashboard. Key metrics:
+
+| Metric          | What it means                                              |
+|-----------------+------------------------------------------------------------|
+| SPS             | Steps per second — how fast the environment is simulating |
+| episode_return  | Average total reward per completed episode                 |
+| episode_length  | Average steps per episode                                  |
+| policy_loss     | PPO surrogate loss (should decrease then stabilize)        |
+| value_loss      | Critic loss (should decrease over time)                    |
+| entropy         | Action randomness (too low = overconfident policy)         |
+| explained_var   | How well the value function predicts returns (want ~0.9+)  |
+| approx_kl       | Policy change per update (kept small by PPO clipping)      |
+
+** Config Files
+
+Default hyperparameters live in ~pufferlib/config/default.ini~. Key settings:
+
+#+begin_src ini
+[train]
+device = cuda
+total_timesteps = 10_000_000
+learning_rate = 0.015
+gamma = 0.995          # Discount factor (0 = myopic, 1 = far-sighted)
+gae_lambda = 0.90      # GAE smoothing (0 = pure TD, 1 = full Monte Carlo)
+clip_coef = 0.2        # PPO clipping (prevents large policy updates)
+ent_coef = 0.001       # Entropy bonus (encourages exploration)
+vf_coef = 2.0          # Value loss weighting
+bptt_horizon = 64      # Steps per segment (also LSTM unroll length)
+#+end_src
+
+Override any setting from the CLI:
+
+#+begin_src shell
+puffer train puffer_snake \
+    --train.total_timesteps 5000000 \
+    --train.learning_rate 0.01 \
+    --train.device cpu
+#+end_src
+
+* Step 2: Understand the Training Loop
+
+The core of PufferLib is the ~PuffeRL~ class in ~pufferlib/pufferl.py~.
+The training loop alternates between two methods:
+
+#+begin_example
+  trainer.evaluate()   →  collect experience (run envs, store transitions)
+  trainer.train()      →  update the policy on collected experience
+#+end_example
+
+** evaluate() — Collecting Experience
+
+Source: ~pufferlib/pufferl.py:229~
+
+The evaluate loop:
+1. Calls ~vecenv.recv()~ to get observations from the environment
+2. Calls ~policy.forward_eval(observations, state)~ to get actions
+3. Samples actions from the returned logits using ~sample_logits()~
+4. Stores (observation, action, logprob, reward, value) in replay buffers
+5. Calls ~vecenv.send(actions)~ to step the environment
+6. Repeats until ~batch_size~ transitions are collected
+
+** train() — Updating the Policy
+
+Source: ~pufferlib/pufferl.py:332~
+
+The train loop:
+1. Computes *advantages* using Generalized Advantage Estimation (GAE)
+2. Samples minibatches from the replay buffer (with priority weighting)
+3. Computes three losses:
+   - *Policy loss*: PPO clipped surrogate (maximizes advantage, bounded by ~clip_coef~)
+   - *Value loss*: MSE between predicted and actual returns
+   - *Entropy loss*: negative entropy bonus (discourages premature certainty)
+4. Backpropagates and applies gradient clipping
+5. Steps the optimizer and learning rate scheduler
+
+** PPO in Plain Language
+
+PPO (Proximal Policy Optimization) solves this problem: you want to improve the
+policy using collected data, but large updates can destabilize training.
+
+The key equation:
+#+begin_example
+  ratio = new_policy(action) / old_policy(action)
+
+  policy_loss = -min(
+      ratio * advantage,
+      clip(ratio, 1-ε, 1+ε) * advantage
+  )
+#+end_example
+
+The ~clip~ prevents the ratio from moving too far from 1.0 (i.e., the new policy
+can't become too different from the policy that collected the data).
+
+*Advantage* = how much better an action was than expected:
+#+begin_example
+  advantage = actual_return - value_estimate
+#+end_example
+
+GAE blends single-step TD errors into a smoother estimate.
+
+* Step 3: Explore an Ocean Environment
+
+The simplest reference environment is ~pufferlib/ocean/squared/squared.py~.
+The comment at the top says: "Use this as a template for your own envs."
+
+** The Squared Environment
+
+~Squared~ is a grid world where an agent navigates to a target.
+
+#+begin_src python
+# pufferlib/ocean/squared/squared.py
+
+class Squared(pufferlib.PufferEnv):
+    def __init__(self, num_envs=1, render_mode=None,
+                 log_interval=128, size=11, buf=None, seed=0):
+
+        # 1. Define spaces BEFORE calling super()
+        self.single_observation_space = gymnasium.spaces.Box(
+            low=0, high=1, shape=(size*size,), dtype=np.uint8)
+        self.single_action_space = gymnasium.spaces.Discrete(5)
+
+        # 2. num_agents = how many agents run in parallel per instance
+        self.num_agents = num_envs
+
+        # 3. Call super() to allocate shared buffers
+        super().__init__(buf)
+
+        # 4. Initialize C bindings (native envs use compiled C for speed)
+        self.c_envs = binding.vec_init(
+            self.observations, self.actions, self.rewards,
+            self.terminals, self.truncations, num_envs, seed, size=size)
+
+    def reset(self, seed=0):
+        binding.vec_reset(self.c_envs, seed)
+        self.tick = 0
+        return self.observations, []   # observations, list of infos
+
+    def step(self, actions):
+        self.tick += 1
+        self.actions[:] = actions      # write into shared buffer
+        binding.vec_step(self.c_envs)  # C code reads actions, writes obs/rew/done
+
+        info = []
+        if self.tick % self.log_interval == 0:
+            info.append(binding.vec_log(self.c_envs))
+
+        return (self.observations, self.rewards,
+                self.terminals, self.truncations, info)
+
+    def close(self):
+        binding.vec_close(self.c_envs)
+#+end_src
+
+** The Shared Buffer Pattern
+
+Notice that ~reset()~ and ~step()~ return ~self.observations~ — a pre-allocated
+NumPy array. This is intentional: zero-copy design means the C code writes directly
+into buffers that Python and PyTorch can read without memory allocation.
+
+~super().__init__(buf)~ in ~PufferEnv~ allocates these buffers:
+
+| Buffer          | Shape                            | Description                     |
+|-----------------+----------------------------------+---------------------------------|
+| observations    | (num_agents, *obs_shape)         | Current observations            |
+| rewards         | (num_agents,)                    | Reward from last step           |
+| terminals       | (num_agents,)                    | True if episode ended naturally |
+| truncations     | (num_agents,)                    | True if episode was cut off     |
+| actions         | (num_agents, *action_shape)      | Actions to execute              |
+
+Source: ~pufferlib/pufferlib.py:22~ (~set_buffers~)
+
+* Step 4: Write a Custom Environment
+
+Now write your own environment without using C bindings — pure Python.
+
+** A Minimal Environment: GridWorld
+
+#+begin_src python
+# my_gridworld.py
+
+import numpy as np
+import gymnasium
+import pufferlib
+
+class GridWorld(pufferlib.PufferEnv):
+    """A minimal grid world: agent must reach the goal."""
+
+    def __init__(self, num_envs=1, size=5, buf=None):
+        self.size = size
+
+        # CRITICAL: define these BEFORE super().__init__()
+        obs_dim = size * size * 2  # agent position + goal position (one-hot)
+        self.single_observation_space = gymnasium.spaces.Box(
+            low=0, high=1, shape=(obs_dim,), dtype=np.float32)
+        self.single_action_space = gymnasium.spaces.Discrete(4)  # up/down/left/right
+        self.num_agents = num_envs
+
+        super().__init__(buf)
+
+        # Internal state (separate from shared buffers)
+        self.agent_pos = np.zeros((num_envs, 2), dtype=np.int32)
+        self.goal_pos = np.zeros((num_envs, 2), dtype=np.int32)
+        self.steps = np.zeros(num_envs, dtype=np.int32)
+        self.max_steps = size * size * 2
+
+    def _make_obs(self):
+        """Write observations into the shared buffer self.observations."""
+        s = self.size
+        self.observations[:] = 0
+        for i in range(self.num_agents):
+            ax, ay = self.agent_pos[i]
+            gx, gy = self.goal_pos[i]
+            self.observations[i, ay * s + ax] = 1            # agent channel
+            self.observations[i, s*s + gy * s + gx] = 1     # goal channel
+
+    def reset(self, seed=None):
+        rng = np.random.default_rng(seed)
+        for i in range(self.num_agents):
+            self.agent_pos[i] = rng.integers(0, self.size, size=2)
+            self.goal_pos[i] = rng.integers(0, self.size, size=2)
+        self.steps[:] = 0
+        self._make_obs()
+        return self.observations, []
+
+    def step(self, actions):
+        deltas = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # up, down, left, right
+
+        for i in range(self.num_agents):
+            dx, dy = deltas[actions[i]]
+            self.agent_pos[i, 0] = np.clip(self.agent_pos[i, 0] + dx, 0, self.size-1)
+            self.agent_pos[i, 1] = np.clip(self.agent_pos[i, 1] + dy, 0, self.size-1)
+            self.steps[i] += 1
+
+            reached = np.array_equal(self.agent_pos[i], self.goal_pos[i])
+            self.rewards[i] = 1.0 if reached else -0.01
+            self.terminals[i] = reached
+            self.truncations[i] = self.steps[i] >= self.max_steps
+
+        self._make_obs()
+        return self.observations, self.rewards, self.terminals, self.truncations, []
+
+    def close(self):
+        pass
+#+end_src
+
+** Common Gotchas
+
+1. *Define spaces before ~super().__init__()~* — the parent allocates buffers based
+   on them. Calling ~super()~ first will raise ~APIUsageError~.
+
+2. *Write into ~self.observations~, don't return new arrays* — the trainer holds a
+   reference to this buffer.
+
+3. *Return ~[]~ for infos* unless you have per-episode statistics to log. The trainer
+   expects a list.
+
+4. *~terminals~ vs ~truncations~*: terminals = natural episode end (reached goal,
+   died). truncations = artificial time limit. The trainer handles them differently
+   for advantage computation.
+
+5. *~num_agents~ is the batch size* — all agents step together. For a single-agent
+   environment, use ~num_agents = num_envs~ (one agent per parallel environment).
+
+** Training Your Custom Environment
+
+#+begin_src python
+# train_gridworld.py
+
+import pufferlib.vector
+import pufferlib.models
+import pufferlib.pufferl as pufferl
+from my_gridworld import GridWorld
+
+# 1. Create vectorized environment
+#    backend=GridWorld means PufferLib calls GridWorld() directly
+#    (no multiprocessing overhead needed since it's already batched)
+vecenv = pufferlib.vector.make(
+    GridWorld,
+    env_kwargs={'num_envs': 256, 'size': 7},
+)
+
+# 2. Create a policy (Default works for flat observations)
+policy = pufferlib.models.Default(vecenv.driver_env, hidden_size=128)
+
+# 3. Load default config and tweak it
+args = pufferl.load_config('default')
+args['train']['device'] = 'cpu'             # use 'cuda' if available
+args['train']['total_timesteps'] = 500_000
+args['train']['bptt_horizon'] = 16
+args['train']['batch_size'] = 256 * 16      # num_agents * bptt_horizon
+
+# 4. Train
+trainer = pufferl.PuffeRL(args['train'], vecenv, policy)
+while trainer.epoch < trainer.total_epochs:
+    trainer.evaluate()
+    trainer.train()
+
+trainer.close()
+#+end_src
+
+Run it:
+
+#+begin_src shell
+python train_gridworld.py
+#+end_src
+
+* Step 5: Understand Policies
+
+Source: ~pufferlib/models.py~
+
+** The Policy Interface
+
+A PufferLib policy is just a ~torch.nn.Module~ with two forward methods:
+
+#+begin_src python
+class MyPolicy(torch.nn.Module):
+    def forward_eval(self, observations, state=None):
+        """Called during data collection (no_grad context, single step)."""
+        # returns: (logits, values)
+
+    def forward(self, observations, state=None):
+        """Called during training (with grad, batch of segments)."""
+        # returns: (logits, values)
+#+end_src
+
+For non-recurrent policies these are identical. For LSTM policies they differ
+in how they handle time dimensions.
+
+** What ~logits~ means
+
+For *discrete* actions: logits is a tensor of shape ~(batch, n_actions)~.
+It is passed to ~Categorical(logits=logits)~ to sample actions.
+
+For *multi-discrete* actions: logits is a tuple of tensors, one per sub-action.
+
+For *continuous* actions: logits is a ~Normal~ distribution object.
+
+~pufferlib.pytorch.sample_logits()~ handles all three cases and returns
+~(action, log_prob, entropy)~.
+
+** The Default Policy
+
+~pufferlib.models.Default~ works for any flat observation space:
+
+#+begin_src python
+# pufferlib/models.py:12
+
+class Default(nn.Module):
+    def __init__(self, env, hidden_size=128):
+        # Automatically handles Discrete, MultiDiscrete, and Box action spaces
+        ...
+        self.encoder = nn.Sequential(
+            layer_init(nn.Linear(num_obs, hidden_size)),
+            nn.GELU(),
+        )
+        self.decoder = layer_init(nn.Linear(hidden_size, num_actions), std=0.01)
+        self.value   = layer_init(nn.Linear(hidden_size, 1), std=1)
+
+    def encode_observations(self, observations, state=None):
+        return self.encoder(observations.float().view(batch, -1))
+
+    def decode_actions(self, hidden):
+        return self.decoder(hidden), self.value(hidden)
+#+end_src
+
+Note ~std=0.01~ for the action head and ~std=1~ for the value head — this is
+orthogonal initialization, which is standard practice in RL policy networks.
+
+** Writing a Custom Policy
+
+#+begin_src python
+import torch
+import torch.nn as nn
+import pufferlib.pytorch
+
+class MyPolicy(nn.Module):
+    def __init__(self, env, hidden_size=256):
+        super().__init__()
+        obs_dim = env.single_observation_space.shape[0]
+        n_actions = env.single_action_space.n
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(obs_dim, hidden_size)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+        )
+        # Small std for actor head: initial policy is nearly uniform
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, n_actions), std=0.01)
+        # Large std for critic: initial value estimates vary widely
+        self.critic = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1.0)
+
+    def encode_observations(self, observations, state=None):
+        return self.encoder(observations.float())
+
+    def decode_actions(self, hidden):
+        return self.actor(hidden), self.critic(hidden)
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        return self.decode_actions(hidden)
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+#+end_src
+
+** Adding an LSTM (for memory tasks)
+
+If your environment requires memory (e.g., ~puffer_tmaze~), wrap your policy:
+
+#+begin_src python
+import pufferlib.models
+
+base_policy = MyPolicy(vecenv.driver_env)
+policy = pufferlib.models.LSTMWrapper(
+    vecenv.driver_env, base_policy,
+    input_size=256,   # must match your hidden_size
+    hidden_size=256,
+)
+
+# Enable RNN mode in config
+args['train']['use_rnn'] = True
+#+end_src
+
+The ~LSTMWrapper~ requires your policy to have ~encode_observations~ and
+~decode_actions~ methods (see above). It handles the time-dimension reshaping
+during training automatically.
+
+* Step 6: Vectorization
+
+Source: ~pufferlib/vector.py~
+
+** The Three Backends
+
+~pufferlib.vector.make()~ supports three backends:
+
+| Backend          | When to use                                            |
+|------------------+--------------------------------------------------------|
+| ~PufferEnv~      | Default for native ocean envs (already batched in C)   |
+| ~Serial~         | Gymnasium/PettingZoo envs, debugging, single-process   |
+| ~Multiprocessing~| Gymnasium/PettingZoo envs in production (multi-core)   |
+
+** Native PufferEnv (ocean environments)
+
+#+begin_src python
+import pufferlib.vector
+from pufferlib.ocean import env_creator
+
+# Ocean envs handle their own batching internally
+# num_envs here means the num_envs kwarg passed to the env constructor
+vecenv = pufferlib.vector.make(
+    env_creator('puffer_snake'),
+    env_kwargs={'num_envs': 1024},  # 1024 parallel snake games
+)
+# vecenv.num_agents == 1024
+#+end_src
+
+** Gymnasium Environments (Serial)
+
+#+begin_src python
+import gymnasium
+import pufferlib.vector
+
+def make_lunar():
+    return gymnasium.make('LunarLander-v2')
+
+vecenv = pufferlib.vector.make(
+    make_lunar,
+    num_envs=8,
+    backend=pufferlib.vector.Serial,
+)
+# Runs 8 LunarLander envs sequentially on one process
+#+end_src
+
+** Gymnasium Environments (Multiprocessing)
+
+#+begin_src python
+vecenv = pufferlib.vector.make(
+    make_lunar,
+    num_envs=16,
+    num_workers=4,      # 4 CPU processes
+    batch_size=8,       # return 8 envs worth of data per recv() call
+    backend=pufferlib.vector.Multiprocessing,
+)
+#+end_src
+
+** Key Parameters
+
+| Parameter    | Meaning                                                  |
+|--------------+----------------------------------------------------------|
+| ~num_envs~   | Total number of parallel environment instances           |
+| ~num_workers~| Number of CPU processes (~auto~ = num_envs)              |
+| ~batch_size~ | Envs returned per ~recv()~ call (~auto~ = num_envs // 2) |
+| ~seed~       | Random seed for reproducibility                          |
+
+The relationship: ~num_envs~ must be divisible by ~num_workers~.
+Each worker runs ~num_envs / num_workers~ environments.
+
+* Step 7: Programmatic Training
+
+The CLI (~puffer train~) is a thin wrapper around these Python functions.
+Use them directly for custom training loops or research.
+
+** The Full Programmatic API
+
+#+begin_src python
+import pufferlib.vector
+import pufferlib.models
+import pufferlib.pufferl as pufferl
+
+# 1. Load config (merges default.ini with environment-specific overrides)
+args = pufferl.load_config('puffer_snake')
+
+# 2. Modify config
+args['train']['total_timesteps'] = 5_000_000
+args['train']['device'] = 'cuda'
+args['train']['learning_rate'] = 0.01
+
+# 3. Create vectorized environment
+vecenv = pufferl.load_env('puffer_snake', args)
+
+# 4. Create policy (looks up Policy class from the environment's torch.py module)
+policy = pufferl.load_policy(args, vecenv, 'puffer_snake')
+
+# 5. Create trainer
+trainer = pufferl.PuffeRL(args['train'], vecenv, policy)
+
+# 6. Train
+while trainer.epoch < trainer.total_epochs:
+    stats = trainer.evaluate()   # returns dict of env stats (episode_return, etc.)
+    logs  = trainer.train()      # returns dict of training metrics (losses, SPS)
+
+    if logs:
+        print(f"Epoch {trainer.epoch}: return={logs.get('environment/episode_return', 'N/A'):.2f}")
+
+trainer.close()
+#+end_src
+
+** Accessing Training Metrics
+
+#+begin_src python
+# After trainer.train(), logs contains:
+logs['SPS']                           # steps per second
+logs['environment/episode_return']    # mean episode return
+logs['losses/policy_loss']            # PPO policy gradient loss
+logs['losses/value_loss']             # critic MSE loss
+logs['losses/entropy']                # entropy bonus
+logs['losses/explained_variance']     # how well critic predicts returns
+#+end_src
+
+** Custom Training Loop Pattern
+
+#+begin_src python
+# For research: intervene between evaluate/train
+for epoch in range(1000):
+    stats = trainer.evaluate()
+
+    # Custom logic here — e.g., curriculum learning
+    if np.mean(stats.get('episode_return', [0])) > 5.0:
+        vecenv.env_kwargs['difficulty'] = 2
+
+    logs = trainer.train()
+#+end_src
+
+** Loading a Checkpoint
+
+#+begin_src python
+import torch
+
+# Save
+torch.save(policy.state_dict(), 'my_policy.pt')
+
+# Load
+state_dict = torch.load('my_policy.pt', map_location='cpu')
+policy.load_state_dict(state_dict)
+#+end_src
+
+Or pass ~--load-model-path~ to the CLI:
+
+#+begin_src shell
+puffer eval puffer_snake --load-model-path experiments/puffer_snake_latest.pt
+#+end_src
+
+* Advanced Topics
+
+** Distributed Training
+
+Train across multiple GPUs using ~torchrun~:
+
+#+begin_src shell
+# 6 GPUs on one machine
+torchrun --standalone --nnodes=1 --nproc-per-node=6 \
+    -m pufferlib.pufferl train puffer_nmmo3
+#+end_src
+
+PufferLib uses ~torch.distributed~ under the hood. Each process runs its own
+vecenv and policy; gradients are synchronized across processes.
+
+** Hyperparameter Sweeps
+
+PufferLib includes a Bayesian optimizer for hyperparameter search:
+
+#+begin_src shell
+puffer sweep puffer_breakout --method Protein --goal maximize --max-runs 50
+#+end_src
+
+The sweep space is defined in ~pufferlib/config/ocean/<envname>.ini~ under
+the ~[sweep]~ section. You can also define your own sweep config files.
+
+Source: ~pufferlib/sweep.py~
+
+** Multi-Agent Environments (PettingZoo)
+
+#+begin_src python
+import pufferlib.emulation
+
+# Wrap a PettingZoo parallel environment
+from pettingzoo.butterfly import pistonball_v6
+pz_env = pistonball_v6.parallel_env()
+puffer_env = pufferlib.emulation.PettingZooPufferEnv(env=pz_env)
+#+end_src
+
+Multi-agent wrappers: ~pufferlib.pufferlib.MultiagentEpisodeStats~,
+~pufferlib.pufferlib.MeanOverAgents~. Source: ~pufferlib/pufferlib.py:250+~
+
+** Wrapping Existing Gymnasium Environments
+
+#+begin_src python
+import gymnasium
+import pufferlib.emulation
+
+gym_env = gymnasium.make('CartPole-v1')
+puffer_env = pufferlib.emulation.GymnasiumPufferEnv(env=gym_env)
+
+vecenv = pufferlib.vector.make(
+    lambda: gymnasium.make('CartPole-v1'),
+    num_envs=8,
+    backend=pufferlib.vector.Serial,
+)
+#+end_src
+
+Source: ~pufferlib/emulation.py~
+
+** Memory-Requiring Environments
+
+For tasks where the agent must remember past observations (e.g., T-Maze, partial
+observability), use the LSTM wrapper:
+
+#+begin_src shell
+# T-Maze: agent must remember which direction to go based on early cue
+puffer train puffer_tmaze
+#+end_src
+
+The environment configs for memory tasks set ~rnn_name = Recurrent~ and
+~use_rnn = True~ automatically.
+
+** Experiment Tracking
+
+#+begin_src shell
+# Weights & Biases
+puffer train puffer_snake --wandb --wandb-project my-project --wandb-group run1
+
+# Neptune
+puffer train puffer_snake --neptune
+#+end_src
+
+* Learning Path Summary
+
+Follow these steps in order:
+
+1. [ ] *Run* ~puffer train puffer_cartpole --train.device cpu~ and watch the dashboard
+2. [ ] *Read* ~pufferlib/ocean/squared/squared.py~ — the canonical env template
+3. [ ] *Read* ~pufferlib/pufferlib.py~ lines 1–100 — the ~PufferEnv~ base class
+4. [ ] *Read* ~pufferlib/models.py~ lines 1–100 — the ~Default~ policy
+5. [ ] *Write* the GridWorld environment from Step 4 above and train it
+6. [ ] *Read* ~pufferlib/pufferl.py~ ~evaluate()~ (line 229) and ~train()~ (line 332)
+7. [ ] *Write* a custom policy for your GridWorld and compare performance
+8. [ ] *Experiment* with ~gamma~, ~gae_lambda~, ~learning_rate~ and observe effects
+9. [ ] *Try* a harder environment: ~puffer train puffer_breakout --train.device cpu~
+10. [ ] *Add* LSTM and train ~puffer train puffer_tmaze~ (memory task)
+
+Good questions to answer as you go:
+
+- What happens to ~episode_return~ as training progresses?
+- What does ~explained_variance~ tell you about the critic?
+- Why does entropy decrease over training? Is that good or bad?
+- What breaks if you set ~learning_rate~ too high (e.g., 0.1)?
+- How does ~gamma~ affect the agent's time horizon?
+#+end_property
+
+* Migrating from 3.0 to 4.0
+
+PufferLib 4.0 is a significant release. The environment-authoring API (~PufferEnv~,
+~reset()~, ~step()~) is unchanged, but the training infrastructure has been rewritten
+in C++/CUDA. Most users will only need to update config keys and the programmatic
+training loop.
+
+** What Did Not Change
+
+- ~PufferEnv~ subclass contract: same ~single_observation_space~, ~single_action_space~,
+  ~num_agents~, ~super().__init__(buf)~ pattern
+- ~reset()~ / ~step()~ return signatures
+- ~pufferlib.vector.make()~, ~Serial~, ~Multiprocessing~ backends
+- CLI entry point: ~puffer train <env>~, ~puffer eval <env>~, ~puffer sweep <env>~
+- ~load_config()~ function and INI file structure (keys renamed — see below)
+- Gymnasium and PettingZoo wrappers (~emulation.py~)
+
+** New C++ Training Backend
+
+4.0's core training loop runs inside a compiled C++/CUDA extension (~_C~).
+This replaces the pure-Python ~PuffeRL~ class as the primary path.
+
+The new cycle is:
+
+#+begin_src python
+from pufferlib import _C
+import pufferlib.pufferl as pufferl
+
+args = pufferl.load_config('puffer_snake')
+
+pufferl_cpp = _C.create_pufferl(args)
+while pufferl_cpp.global_step < args['train']['total_timesteps']:
+    _C.rollouts(pufferl_cpp)
+    _C.train(pufferl_cpp)
+
+_C.close(pufferl_cpp)
+#+end_src
+
+The ~pufferlib.pufferl.train()~ convenience function wraps this automatically.
+Note that in 4.0 ~train()~ no longer accepts ~vecenv~ or ~policy~ keyword arguments —
+it builds everything from ~args~ internally.
+
+*** Python fallback for custom training loops
+
+The old Python-based trainer is preserved in ~pufferlib/python_pufferl.py~.
+Use it when you need step-level control (curriculum learning, custom logging, etc.):
+
+#+begin_src python
+from pufferlib.python_pufferl import PuffeRL
+import pufferlib.vector, pufferlib.models, pufferlib.pufferl as pufferl
+
+args    = pufferl.load_config('puffer_snake')
+vecenv  = pufferlib.vector.make(...)
+policy  = pufferlib.models.Default(vecenv.driver_env)
+
+# NOTE: pass the full args dict, not args['train'] as in 3.0
+trainer = PuffeRL(args, vecenv, policy)
+
+while trainer.epoch < trainer.total_epochs:
+    trainer.evaluate()
+    trainer.train()
+
+trainer.close()
+#+end_src
+
+Key difference from 3.0: ~PuffeRL~ now takes the full ~args~ dict, not ~args['train']~.
+
+** Config Key Renames
+
+Many hyperparameter names changed. Update your ~.ini~ overrides and CLI flags:
+
+| 3.0 key               | 4.0 key               | Notes                                  |
+|-----------------------+-----------------------+----------------------------------------|
+| ~[train] bptt_horizon~  | ~[train] horizon~       | Renamed                                |
+| ~[vec] num_envs~        | ~[vec] total_agents~    | Semantics changed (see below)          |
+| ~[vec] num_workers~     | ~[vec] num_threads~     | Renamed                                |
+| ~[vec] backend~         | (removed)             | Backend is now native-only in C++ path |
+| ~[train] adam_beta1~    | ~[train] beta1~         | Renamed                                |
+| ~[train] adam_beta2~    | ~[train] beta2~         | Renamed                                |
+| ~[train] data_dir~      | ~[base] checkpoint_dir~ | Moved out of ~[train]~                   |
+| ~[train] update_epochs~ | (removed)             | Always 1 in 4.0                        |
+| ~[train] precision~     | compile-time flag     | See Precision section below            |
+
+New settings added in 4.0:
+
+| Key                  | Default | Description                                  |
+|----------------------+---------+----------------------------------------------|
+| ~[train] replay_ratio~ | ~1.0~     | How many times to reuse collected experience |
+| ~[base] cudagraphs~    | ~10~      | Epoch to capture CUDA graphs; ~-1~ disables    |
+| ~[vec] num_buffers~    | ~2~       | Number of parallel rollout buffers           |
+
+*** total_agents vs num_envs
+
+3.0 used ~num_envs * num_workers~ to set total parallelism, then PuffeRL computed its
+batch size from that. 4.0 makes the total explicit:
+
+#+begin_src ini
+[vec]
+total_agents = 4096   ; replaces num_envs * num_workers
+num_threads  = 16     ; worker threads (replaces num_workers)
+#+end_src
+
+The effective batch size is always ~total_agents * horizon~ (previously
+~num_envs * num_workers * bptt_horizon~).
+
+** Checkpoint Format Changed
+
+3.0 used PyTorch ~.pt~ files:
+
+#+begin_src python
+# 3.0 save / load
+torch.save(policy.state_dict(), 'my_policy.pt')
+policy.load_state_dict(torch.load('my_policy.pt'))
+#+end_src
+
+4.0 uses a native C++ binary format (~.bin~):
+
+#+begin_src python
+# 4.0 save / load (C++ backend)
+_C.save_weights(pufferl_cpp, 'my_policy.bin')
+_C.load_weights(pufferl_cpp, 'my_policy.bin')
+#+end_src
+
+Old ~.pt~ checkpoints are *not* compatible with 4.0. To pass ~--load-model-path~ on
+the CLI, the path must point to a ~.bin~ file produced by 4.0.
+
+** Policy API Changes
+
+*** Default policy now includes LSTM
+
+In 3.0, ~pufferlib.models.Default~ was a stateless MLP. In 4.0 it ships with a
+built-in multi-layer LSTM.
+
+Consequences:
+
+1. ~forward_eval~ now returns a *3-tuple* ~(logits, values, new_state)~ instead of 2.
+2. All recurrent models (including ~Default~) must implement
+   ~initial_state(batch_size, device)~ → returns the initial hidden-state tuple.
+3. ~forward(x)~ for training receives a *(B, T, *obs_shape)* tensor (batch × time ×
+   observation) and returns ~(logits, values)~.
+
+If you wrote a custom policy in 3.0 with ~forward_eval(obs, state=None)~ returning
+a 2-tuple, update it to return 3 values or switch to one of the built-in models.
+
+*** New recurrent model classes
+
+| Class   | Description                                               |
+|---------+-----------------------------------------------------------|
+| ~Default~ | Linear encoder + LSTM (new default, recurrent)            |
+| ~GRU~     | Linear encoder + GRU with residual + RMSNorm              |
+| ~MinGRU~  | Minimal GRU (log-space, parallelisable) from MinGRU paper |
+| ~Mamba~   | Mamba2 SSM (requires ~mamba-ssm~ package)                   |
+
+*** LSTMWrapper signature changed
+
+If you used ~pufferlib.models.LSTMWrapper~ in 3.0:
+
+#+begin_src python
+# 3.0
+wrapper = pufferlib.models.LSTMWrapper(vecenv.driver_env, my_policy, hidden_size=256)
+
+# 4.0 — takes a callable that constructs the inner policy
+wrapper = pufferlib.models.LSTMWrapper(
+    vecenv.driver_env,
+    make_policy_fn=lambda: MyPolicy(vecenv.driver_env),
+    hidden_size=256,
+)
+#+end_src
+
+** Precision
+
+4.0's C++ backend uses a compile-time ~precision_t~ typedef (~float~ or ~__nv_bfloat16~).
+The commit notes recommend building with ~float~ precision:
+
+#+begin_src shell
+# Pass --precision=float when invoking training (wires into the C++ template)
+puffer train puffer_breakout --precision=float
+#+end_src
+
+The Python fallback (~python_pufferl.PuffeRL~) retains the ~use_amp~ toggle for
+bfloat16 via ~torch.amp.autocast~.
+
+** Repository Map Update
+
+#+begin_example
+PufferLib/
+├── pufferlib/
+│   ├── pufferlib.py      ← PufferEnv base class (unchanged)
+│   ├── pufferl.py        ← CLI entry point + C++ training wrapper (NEW)
+│   ├── python_pufferl.py ← Python training loop (moved from pufferl.py)
+│   ├── models.py         ← Default(LSTM), GRU, MinGRU, Mamba, LSTMWrapper
+│   ├── muon.py           ← Muon optimizer implementation (new standalone file)
+│   ├── vector.py         ← Vectorized env runners (unchanged API)
+│   └── src/              ← C++/CUDA source for the _C extension (new)
+│       ├── kernels.cu     ← Core CUDA kernels
+│       ├── pufferlib.cu   ← Full training pipeline
+│       ├── models.cu      ← Native model forward passes
+│       └── ocean.cu       ← Native environment step kernels
+#+end_example
+
+** Quick Migration Checklist
+
+1. [ ] *Rebuild* with ~uv pip install -e . --no-build-isolation~ (C++ extension required)
+2. [ ] *Rename config keys*: ~bptt_horizon~→~horizon~, ~num_envs~→~total_agents~,
+       ~adam_beta1/2~→~beta1/beta2~, ~data_dir~→~checkpoint_dir~
+3. [ ] *Update ~[vec]~ section*: replace ~num_envs~ + ~num_workers~ with ~total_agents~ + ~num_threads~
+4. [ ] *Update programmatic loops*: pass full ~args~ to ~PuffeRL~; or switch to ~_C~ backend
+5. [ ] *Update custom policies*: ~forward_eval~ must return 3-tuple; implement ~initial_state~
+6. [ ] *Discard old ~.pt~ checkpoints*: format is ~.bin~ in 4.0
+7. [ ] *Add ~--precision=float~* to training commands if using the C++ backend
