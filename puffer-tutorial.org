@@ -118,6 +118,65 @@ To skip compiling ocean environments entirely (if you only want Gymnasium wrappe
 NO_OCEAN=1 uv pip install -e . --no-build-isolation
 #+end_src
 
+*** macOS (Apple Silicon)
+
+PufferLib builds and trains natively on Apple Silicon (M1/M2/M3/M4). It does not
+support CUDA (no NVIDIA GPU), so all training runs on CPU or MPS.
+
+*Prerequisites* — make sure Xcode Command Line Tools are installed (they provide
+~clang~, ~make~, and the system headers the C extensions need):
+
+#+begin_src shell
+xcode-select --install
+#+end_src
+
+*Installation* — use the same command as the main instructions. No ~CUDA_HOME=""~
+workaround is needed because CUDA does not exist on macOS:
+
+#+begin_src shell
+uv pip install torch
+uv pip install -e . --no-build-isolation
+#+end_src
+
+The build system detects ~Darwin~ and automatically downloads ~raylib-5.5_macos~
+and ~box2d-macos-arm64~, then links the required macOS frameworks (~Cocoa~,
+~OpenGL~, ~IOKit~).
+
+*Training on CPU* — the default config sets ~device = cuda~, which does not exist
+on macOS. Always pass ~--train.device cpu~ (or set it in your config):
+
+#+begin_src shell
+puffer train puffer_snake --train.device cpu
+#+end_src
+
+*Training on MPS (Apple Silicon GPU)* — ~torch.backends.mps.is_available()~ is
+~True~ on M-series hardware, and you can try ~--train.device mps~. However,
+PufferLib's advantage kernel has no MPS path; it automatically falls back to CPU
+by copying tensors from MPS to CPU, computing, then copying back — once per
+training step. In practice this makes MPS *slower* than plain CPU for most
+environments. Stick with ~--train.device cpu~ unless you profile and confirm
+otherwise.
+
+*Intel Mac* — not tested. The prebuilt Box2D binary (~box2d-macos-arm64~) will not
+load on x86_64, so any environment that uses Box2D (currently ~impulse_wars~) will
+fail to build. All other ocean environments should compile correctly.
+
+*Multiprocessing backend* — the ~Multiprocessing~ vectorization backend is known
+to be unreliable on macOS (a required call to ~set_start_method('fork')~ is
+commented out because it breaks hyperparameter sweeps). For wrapping Gymnasium
+or PettingZoo environments, use the ~Serial~ backend instead:
+
+#+begin_src python
+vecenv = pufferlib.vector.make(
+    make_env_fn,
+    num_envs=8,
+    backend=pufferlib.vector.Serial,   # use Serial on macOS, not Multiprocessing
+)
+#+end_src
+
+Native ocean environments (~puffer_snake~, ~puffer_breakout~, etc.) are unaffected
+because they handle their own batching in C and never use the multiprocessing backend.
+
 *** Rebuilding a Single Environment
 
 If you modify an ocean environment's C code, you don't need to rebuild everything.
