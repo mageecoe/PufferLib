@@ -1,0 +1,914 @@
+% ppo_tutorial.tex
+% A tutorial on the PPO algorithm, culminating in the implementation details of PufferLib.
+
+\documentclass[12pt, a4paper]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{bm}
+\usepackage{bbm}
+
+\geometry{margin=2.5cm}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  urlcolor=blue!70!black,
+  citecolor=blue!70!black,
+}
+
+% Code listing style
+\lstdefinestyle{pythonstyle}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!80!black}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{orange!80!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  backgroundcolor=\color{gray!8},
+  xleftmargin=1.5em,
+  framexleftmargin=1.5em,
+}
+
+\lstdefinestyle{cstyle}{
+  language=C,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!80!black}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{orange!80!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  backgroundcolor=\color{gray!8},
+  xleftmargin=1.5em,
+  framexleftmargin=1.5em,
+}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+
+% Convenience macros
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\traj}{\tau}
+\newcommand{\pith}{\pi_\theta}
+\newcommand{\piold}{\pi_{\theta_\mathrm{old}}}
+\newcommand{\Rtraj}{R(\traj)}
+\newcommand{\Jth}{J(\theta)}
+\newcommand{\grad}{\nabla_\theta}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\clip}{\mathrm{clip}}
+
+\title{\textbf{A Tutorial on Proximal Policy Optimization}\\[0.5em]
+\large From Policy Gradients to PufferLib}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ---------------------------------------------------------------------------
+\section{Nomenclature and Problem Setup}
+\label{sec:nomenclature}
+% ---------------------------------------------------------------------------
+
+We consider the standard reinforcement learning (RL) setting: an agent interacts with an
+environment over discrete time steps, observing states and selecting actions, with the
+goal of maximizing accumulated reward.
+
+\subsection{Trajectories}
+
+A \emph{trajectory} (or \emph{rollout}) of horizon $H$ is the sequence
+\begin{equation}
+  \traj = (s_0, a_0, r_0,\; s_1, a_1, r_1,\; \ldots,\; s_H, a_H, r_H),
+\end{equation}
+where $s_t \in \mathcal{S}$ is the state, $a_t \in \mathcal{A}$ the action, and
+$r_t \in \R$ the scalar reward received at step $t$.
+
+\subsection{Policy}
+
+A \emph{stochastic policy} $\pith$ is a conditional distribution over actions given states,
+parameterised by a vector $\theta$:
+\begin{equation}
+  \pith(a \mid s) = \Pr_\theta[A_t = a \mid S_t = s].
+\end{equation}
+In deep RL this is typically a neural network with weights $\theta$.
+
+\subsection{Total Discounted Return}
+
+Given a discount factor $\gamma \in [0, 1)$, the \emph{discounted return} of a
+trajectory is
+\begin{equation}
+  \Rtraj = \sum_{t=0}^{H} \gamma^t r_t.
+\end{equation}
+The discount factor down-weights future rewards, both for mathematical convenience
+(ensuring convergence) and to reflect temporal preference.
+
+\subsection{Value and Advantage Functions}
+
+\begin{definition}[State-value function]
+  $V^\pi(s) = \E_\pi\!\left[\Rtraj \mid s_0 = s\right]$,
+  the expected return when starting in state $s$ and following $\pi$ thereafter.
+\end{definition}
+
+\begin{definition}[Action-value function]
+  $Q^\pi(s, a) = \E_\pi\!\left[\Rtraj \mid s_0 = s, a_0 = a\right]$.
+\end{definition}
+
+\begin{definition}[Advantage function]
+  \begin{equation}
+    A^\pi(s, a) = Q^\pi(s, a) - V^\pi(s).
+  \end{equation}
+  The advantage measures how much better action $a$ is compared to the average action
+  taken by $\pi$ in state $s$.
+\end{definition}
+
+\subsection{Utility Function}
+
+The quantity we want to maximise is the \emph{utility}
+\begin{equation}
+  \Jth = \E_{\traj \sim \pith}\!\left[\Rtraj\right]
+       = \E_{\traj \sim \pith}\!\left[\sum_{t=0}^{H} \gamma^t r_t\right].
+\end{equation}
+Since the expectation is taken over trajectories sampled from the current policy, both
+the sampling distribution \emph{and} the rewards depend on $\theta$, making
+direct optimisation non-trivial.
+
+% ---------------------------------------------------------------------------
+\section{The Policy Gradient Theorem}
+\label{sec:pg}
+% ---------------------------------------------------------------------------
+
+\subsection{Deriving the Gradient of the Utility}
+
+To apply first-order (gradient) methods we need $\grad \Jth$.  The key observation is the
+\emph{log-derivative trick} (also called the REINFORCE trick):
+
+\begin{equation}
+  \grad \pith(a \mid s)
+    = \pith(a \mid s)\, \grad \log \pith(a \mid s).
+\end{equation}
+
+The probability of a trajectory under policy $\pith$ factorises as
+\begin{equation}
+  p_\theta(\traj) = p(s_0) \prod_{t=0}^{H} \pith(a_t \mid s_t)\, p(s_{t+1} \mid s_t, a_t),
+\end{equation}
+so the log-probability decomposes as
+\begin{equation}
+  \log p_\theta(\traj) = \log p(s_0)
+    + \sum_{t=0}^{H} \log \pith(a_t \mid s_t)
+    + \sum_{t=0}^{H} \log p(s_{t+1} \mid s_t, a_t).
+\end{equation}
+Only the middle sum depends on $\theta$, hence
+\begin{equation}
+  \grad \log p_\theta(\traj) = \sum_{t=0}^{H} \grad \log \pith(a_t \mid s_t).
+\end{equation}
+
+Applying the log-derivative trick to the utility gives
+\begin{align}
+  \grad \Jth
+    &= \grad \int p_\theta(\traj)\, \Rtraj\, d\traj \nonumber\\
+    &= \int \grad p_\theta(\traj)\, \Rtraj\, d\traj \nonumber\\
+    &= \int p_\theta(\traj)\, \grad \log p_\theta(\traj)\, \Rtraj\, d\traj \nonumber\\
+    &= \E_{\traj \sim \pith}\!\left[\Rtraj\, \grad \log p_\theta(\traj)\right].
+\end{align}
+
+Substituting the factorisation of $\grad \log p_\theta(\traj)$ yields the
+\textbf{REINFORCE policy gradient estimator}:
+\begin{equation}
+  \boxed{
+    \grad \Jth
+      = \E_{\traj \sim \pith}\!\left[
+          \sum_{t=0}^{H} \grad \log \pith(a_t \mid s_t)\, \Rtraj
+        \right].
+  }
+  \label{eq:reinforce}
+\end{equation}
+
+\subsection{Monte-Carlo Estimation}
+
+In practice we approximate Eq.~\eqref{eq:reinforce} with a sample average over $N$
+trajectories $\{\traj^{(i)}\}_{i=1}^N$:
+\begin{equation}
+  \grad \Jth \approx
+    \frac{1}{N}\sum_{i=1}^{N} \sum_{t=0}^{H}
+      \grad \log \pith(a_t^{(i)} \mid s_t^{(i)})\, R(\traj^{(i)}).
+\end{equation}
+This estimator is unbiased but can have very high variance, which motivates the
+modifications described in Section~\ref{sec:variance}.
+
+% ---------------------------------------------------------------------------
+\section{Variance Reduction}
+\label{sec:variance}
+% ---------------------------------------------------------------------------
+
+High variance in the policy gradient estimate leads to unstable training.  Three
+standard techniques are used to reduce it.
+
+\subsection{Reward-to-Go}
+
+Using the full return $R(\tau)$ introduces unnecessary noise: actions at step $t$
+cannot influence rewards received \emph{before} $t$.  Replacing $\Rtraj$ with
+the \emph{reward-to-go}
+\begin{equation}
+  \hat{R}_t = \sum_{t'=t}^{H} \gamma^{t'-t} r_{t'}
+\end{equation}
+gives an estimator with the same expectation but lower variance:
+\begin{equation}
+  \grad \Jth
+    = \E_{\traj \sim \pith}\!\left[
+        \sum_{t=0}^{H} \grad \log \pith(a_t \mid s_t)\, \hat{R}_t
+      \right].
+\end{equation}
+
+\subsection{Baseline Subtraction}
+
+Adding any function $b(s_t)$ that does not depend on the action does not bias the
+gradient (since $\E_a[\nabla_\theta \log \pi_\theta(a|s)\, b(s)] = 0$), but can
+reduce variance.  A natural choice is the state-value function $V^\pi(s_t)$:
+\begin{equation}
+  \grad \Jth
+    = \E\!\left[
+        \sum_{t} \grad \log \pith(a_t \mid s_t)\,
+        \bigl(\hat{R}_t - V^\pi(s_t)\bigr)
+      \right].
+\end{equation}
+The term $\hat{R}_t - V^\pi(s_t)$ approximates the advantage $A^\pi(s_t, a_t)$.
+In practice we use a learned critic $V_\phi(s)$ to estimate the baseline.
+
+\subsection{Actor-Critic Methods}
+\label{sec:actor_critic}
+
+Baseline subtraction (Section~\ref{sec:variance}) still uses a Monte-Carlo estimate
+of the return: the gradient update is computed only \emph{after} a full trajectory
+has been collected, and the baseline $V_\phi(s_t)$ reduces variance without
+contributing to the return estimate itself.
+
+An \emph{actor-critic} method goes one step further by letting the critic
+\emph{replace} the Monte-Carlo return with a bootstrapped estimate.  The policy
+(the \emph{actor}) is updated using a one-step TD advantage:
+\begin{equation}
+  \hat{A}_t^{\mathrm{TD}} = r_{t+1} + \gamma V_\phi(s_{t+1})(1 - d_{t+1}) - V_\phi(s_t),
+  \label{eq:td_adv}
+\end{equation}
+where $V_\phi$ is the learned critic.  Both components are trained concurrently:
+the actor maximises expected return via the policy gradient, while the critic
+minimises a regression loss against TD targets.
+
+\paragraph{Key difference from REINFORCE with a baseline.}
+In REINFORCE with a baseline the value function $V_\phi$ appears \emph{only} as a
+control variate---it does not enter the return estimate.  The policy gradient still
+uses the full sum of future rewards $\hat{R}_t$, which is unbiased but high-variance.
+An actor-critic method substitutes $\hat{R}_t$ with the (lower-variance but biased)
+bootstrapped target in Eq.~\eqref{eq:td_adv}.  The trade-off is:
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  & \textbf{REINFORCE + baseline} & \textbf{Actor-critic (TD)} \\
+  \midrule
+  Bias    & None (unbiased gradient)  & Introduced by bootstrapping \\
+  Variance & High (full MC return)    & Lower (single-step TD)      \\
+  Updates & After full episode        & After each step (online)    \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Because the critic bootstraps from its own (imperfect) predictions, approximation
+bias accumulates when the value function is inaccurate.  The choice of how many
+steps to unroll before bootstrapping controls the bias-variance trade-off, which
+Generalised Advantage Estimation formalises as a continuous interpolation via the
+$\lambda$ parameter.
+
+\subsection{Generalised Advantage Estimation (GAE)}
+\label{sec:gae}
+
+Schulman et al.\ \cite{schulman2016gae} introduced GAE as a low-variance, low-bias estimate of the
+advantage.  For a $\lambda$-weighted mixture of $k$-step TD errors
+$\delta_t^{(k)} = r_t + \gamma V(s_{t+1}) - V(s_t)$,
+the GAE estimator is
+\begin{equation}
+  \hat{A}_t^{\mathrm{GAE}(\gamma, \lambda)}
+    = \sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+l},
+  \label{eq:gae}
+\end{equation}
+where $\delta_t = r_{t+1} + \gamma V(s_{t+1})(1 - d_{t+1}) - V(s_t)$ is the
+one-step TD residual and $d_{t+1} \in \{0,1\}$ indicates episode termination.
+
+Setting $\lambda = 0$ recovers the TD(0) advantage (high bias, low variance);
+$\lambda = 1$ recovers the Monte-Carlo advantage (low bias, high variance).
+Intermediate values trade off between the two.
+
+% ---------------------------------------------------------------------------
+\section{Trust Region Policy Optimisation (TRPO)}
+\label{sec:trpo}
+% ---------------------------------------------------------------------------
+
+\subsection{Motivation}
+
+A fundamental problem with vanilla policy gradient is that a step too large in parameter
+space can collapse performance catastrophically and irreversibly, because the new
+sampling distribution is far from the one used to collect data.
+
+\subsection{The Surrogate Objective}
+
+Schulman et al.\ \cite{schulman2015trpo} construct a \emph{surrogate objective} that can be optimised
+with the \emph{old} samples.  Define the importance-sampling ratio
+\begin{equation}
+  r_t(\theta) = \frac{\pith(a_t \mid s_t)}{\piold(a_t \mid s_t)}.
+\end{equation}
+The surrogate objective is
+\begin{equation}
+  L^{\mathrm{CPI}}(\theta)
+    = \E_t\!\left[r_t(\theta)\, \hat{A}_t\right],
+\end{equation}
+which matches $\Jth$ to first order around $\theta_\mathrm{old}$ but can be
+optimised with fixed samples.
+
+\subsection{The KL Constraint}
+
+To prevent the new policy from straying too far from the old one, TRPO solves
+\begin{equation}
+  \max_\theta\; L^{\mathrm{CPI}}(\theta)
+  \quad \text{subject to} \quad
+  \E_t\!\left[\KL\!\left(\piold(\cdot \mid s_t) \;\|\; \pith(\cdot \mid s_t)\right)\right]
+    \leq \delta,
+  \label{eq:trpo}
+\end{equation}
+where $\delta$ is a small trust-region radius.
+
+The constraint is enforced via a conjugate-gradient solve for the natural gradient
+direction followed by a line-search.  This guarantees monotonic policy improvement but
+comes with significant implementation complexity:
+\begin{itemize}
+  \item Requires second-order information (Fisher-vector products).
+  \item Conjugate gradient and back-tracking line-search add engineering overhead.
+  \item Difficult to apply to architectures with shared parameters between actor and
+        critic.
+  \item Not directly compatible with small-batch stochastic gradient descent.
+\end{itemize}
+These drawbacks motivate the simpler PPO family of algorithms.
+
+% ---------------------------------------------------------------------------
+\section{From TRPO to PPO: Internalising the Constraint}
+\label{sec:trpo_to_ppo}
+% ---------------------------------------------------------------------------
+
+\subsection{Lagrangian Relaxation of TRPO}
+
+The constrained problem in Eq.~\eqref{eq:trpo} can be converted to an unconstrained
+one by introducing a Lagrange multiplier $\beta \geq 0$:
+\begin{equation}
+  \max_\theta\;
+    L^{\mathrm{CPI}}(\theta)
+    - \beta\;
+    \E_t\!\left[\KL\!\left(\piold(\cdot \mid s_t) \;\|\; \pith(\cdot \mid s_t)\right)\right].
+  \label{eq:kl_penalty}
+\end{equation}
+This \emph{KL-penalty} formulation is an equivalent characterisation of TRPO: for the
+right value of $\beta$ the unconstrained solution coincides with the constrained one.
+
+The trouble is that $\beta$ must be tuned---or adapted---to match the desired
+trust-region radius $\delta$, and the appropriate value varies across environments and
+over the course of training.  Adaptive schemes (increasing $\beta$ when the KL exceeds
+$\delta$ and decreasing it otherwise) work in practice but introduce an additional
+hyper-parameter loop and make the algorithm more brittle.
+
+More fundamentally, the KL penalty is a somewhat indirect handle on what we actually
+care about.  This motivates asking: \emph{what does the KL constraint protect against,
+and can we express that protection more directly in the objective?}
+
+\subsection{What Does the KL Constraint Actually Do?}
+
+The surrogate $L^{\mathrm{CPI}}$ relies on importance sampling: data collected under
+$\piold$ are reused to estimate the gradient for $\pith$.  This is valid as long as
+the two distributions are close, because the importance-sampling ratio
+\begin{equation}
+  r_t(\theta) = \frac{\pith(a_t \mid s_t)}{\piold(a_t \mid s_t)}
+\end{equation}
+remains well-behaved.  When $r_t \gg 1$ or $r_t \approx 0$, a single sampled
+transition dominates or vanishes in the estimate, and the surrogate diverges from the
+true objective.
+
+The KL divergence is one measure of how far $\pith$ has moved from $\piold$, but it
+acts on the full distribution.  At the level of individual action probabilities, what
+matters is simply that $r_t$ stays close to 1.  In fact, to first order
+\begin{equation}
+  \KL\!\left(\piold(\cdot \mid s) \;\|\; \pith(\cdot \mid s)\right)
+  \;\approx\;
+  \tfrac{1}{2}\,\E_{a \sim \piold}\!\left[(r_t(\theta) - 1)^2\right],
+\end{equation}
+so the KL constraint is essentially a constraint on how much $r_t$ can deviate from 1.
+
+This suggests a simpler route: instead of penalising the KL divergence globally,
+\emph{directly prevent $r_t$ from leaving a symmetric interval
+$[1 - \varepsilon,\, 1 + \varepsilon]$} around 1.
+
+\subsection{Deriving the Clipped Objective}
+
+Suppose we want to maximise $L^{\mathrm{CPI}}(\theta) = \E_t[r_t(\theta)\,\hat{A}_t]$
+subject to $r_t(\theta) \in [1-\varepsilon, 1+\varepsilon]$.  The question is what
+happens to the gradient when $r_t$ reaches the boundary of this interval.
+
+We want a \emph{pessimistic} objective: one that gives no gradient incentive to push
+$r_t$ further outside the interval than it already is.  Consider the two cases
+separately.
+
+\paragraph{Case 1: $\hat{A}_t > 0$ (the action was better than average).}
+We want to increase $r_t$---but only up to $1 + \varepsilon$.  Beyond that point the
+update is too large to trust.  An objective that captures this is
+\begin{equation}
+  \min\!\bigl(r_t\,\hat{A}_t,\; (1+\varepsilon)\,\hat{A}_t\bigr)
+  = \min\!\bigl(r_t,\; 1+\varepsilon\bigr)\,\hat{A}_t.
+\end{equation}
+The gradient is positive (encouraging increasing $r_t$) when $r_t < 1+\varepsilon$,
+and zero beyond it.
+
+\paragraph{Case 2: $\hat{A}_t < 0$ (the action was worse than average).}
+We want to decrease $r_t$---but only down to $1 - \varepsilon$.  An objective that
+captures this is
+\begin{equation}
+  \min\!\bigl(r_t\,\hat{A}_t,\; (1-\varepsilon)\,\hat{A}_t\bigr)
+  = \max\!\bigl(r_t,\; 1-\varepsilon\bigr)\,\hat{A}_t.
+\end{equation}
+Because $\hat{A}_t < 0$, the $\min$ over two negative quantities takes the one
+closest to zero, i.e.\ it stops the ratio from being pushed below $1 - \varepsilon$.
+
+\paragraph{Unified form.}
+Both cases are captured simultaneously by
+\begin{equation}
+  \min\!\bigl(r_t(\theta)\,\hat{A}_t,\;
+              \clip\!\bigl(r_t(\theta), 1-\varepsilon, 1+\varepsilon\bigr)\,\hat{A}_t\bigr),
+\end{equation}
+which equals $r_t\,\hat{A}_t$ inside the interval and flattens at the boundary
+regardless of the sign of $\hat{A}_t$.  Taking the expectation over time steps yields
+the \emph{clipped surrogate objective}
+\begin{equation}
+  L^{\mathrm{CLIP}}(\theta)
+    = \E_t\!\left[
+        \min\!\bigl(
+          r_t(\theta)\,\hat{A}_t,\;
+          \clip\!\bigl(r_t(\theta), 1-\varepsilon, 1+\varepsilon\bigr)\,\hat{A}_t
+        \bigr)
+      \right],
+\end{equation}
+which is precisely the PPO objective introduced in Section~\ref{sec:ppo}.
+
+\begin{remark}
+  $L^{\mathrm{CLIP}}$ is a lower bound on $L^{\mathrm{CPI}}$ in the region where
+  $r_t \in [1-\varepsilon, 1+\varepsilon]$, and equals it there exactly.  Outside the
+  interval the clipping makes the bound loose in a direction that discourages further
+  deviation---the objective becomes a conservative, pessimistic surrogate rather than an
+  optimistic one.  This is the key structural property that gives PPO its stability.
+\end{remark}
+
+% ---------------------------------------------------------------------------
+\section{Proximal Policy Optimisation (PPO)}
+\label{sec:ppo}
+% ---------------------------------------------------------------------------
+
+\subsection{The Clipped Surrogate Objective}
+
+Schulman et al.\ \cite{schulman2017ppo} propose replacing the hard KL constraint with a soft,
+\emph{clipped} surrogate objective that implicitly penalises large policy changes:
+\begin{equation}
+  L^{\mathrm{CLIP}}(\theta)
+    = \E_t\!\left[
+        \min\!\bigl(
+          r_t(\theta)\,\hat{A}_t,\;
+          \clip\!\bigl(r_t(\theta), 1-\varepsilon, 1+\varepsilon\bigr)\,\hat{A}_t
+        \bigr)
+      \right],
+  \label{eq:clip}
+\end{equation}
+where $\varepsilon > 0$ (typically $0.1$--$0.2$) is the clipping coefficient.
+
+The intuition is straightforward:
+\begin{itemize}
+  \item When $\hat{A}_t > 0$, the gradient pushes $r_t$ upward.  The clip prevents the
+        ratio from exceeding $1 + \varepsilon$, discouraging an excessively large update
+        on a single positive sample.
+  \item When $\hat{A}_t < 0$, the gradient pushes $r_t$ downward.  The clip prevents the
+        ratio from falling below $1 - \varepsilon$.
+\end{itemize}
+Taking the $\min$ ensures we never benefit from moving $r_t$ outside $[1-\varepsilon,
+1+\varepsilon]$.
+
+\subsection{Value Function Loss}
+
+Alongside the policy, PPO trains a value function $V_\phi$ by minimising a clipped MSE
+loss:
+\begin{equation}
+  L^{\mathrm{VF}}(\phi)
+    = \E_t\!\left[
+        \max\!\left(
+          \bigl(V_\phi(s_t) - \hat{R}_t\bigr)^2,\;
+          \bigl(\clip(V_\phi(s_t), V_{\phi_\mathrm{old}}(s_t) - \varepsilon_V,
+                                   V_{\phi_\mathrm{old}}(s_t) + \varepsilon_V)
+            - \hat{R}_t\bigr)^2
+        \right)
+      \right],
+\end{equation}
+where $\hat{R}_t = \hat{A}_t + V_{\phi_\mathrm{old}}(s_t)$ are the estimated returns and
+$\varepsilon_V$ (often equal to $\varepsilon$) is the value clipping coefficient.
+
+\subsection{Entropy Bonus}
+
+An entropy bonus is added to encourage exploration:
+\begin{equation}
+  L^{\mathrm{ENT}}(\theta) = \E_t\!\left[H\!\left[\pith(\cdot \mid s_t)\right]\right],
+\end{equation}
+where $H[\cdot]$ denotes the Shannon entropy.
+
+\subsection{Full PPO Objective}
+
+The combined objective minimised at each update is
+\begin{equation}
+  \boxed{
+    L^{\mathrm{PPO}}(\theta, \phi)
+      = -L^{\mathrm{CLIP}}(\theta)
+        + c_\mathrm{VF}\, L^{\mathrm{VF}}(\phi)
+        - c_\mathrm{ENT}\, L^{\mathrm{ENT}}(\theta),
+  }
+  \label{eq:ppo_full}
+\end{equation}
+with scalar coefficients $c_\mathrm{VF}$ and $c_\mathrm{ENT}$ controlling the relative
+weighting of the three terms.
+
+\subsection{Implementation}
+
+PPO is attractive because it requires only first-order optimisation (e.g.\ Adam),
+makes multiple gradient steps over the same batch of collected data (controlled by
+\texttt{update\_epochs}), and needs no conjugate gradient or second-order information.
+The clipping mechanism serves as a lightweight trust-region surrogate.
+
+% ---------------------------------------------------------------------------
+\section{Extensions in PufferLib}
+\label{sec:pufferlib}
+% ---------------------------------------------------------------------------
+
+PufferLib implements PPO with several extensions that improve sample efficiency and
+training stability.  The main training loop lives in
+\texttt{pufferlib/pufferl.py} (\texttt{PuffeRL.train()}, lines 332--476).
+
+\subsection{V-Trace Importance Weighting}
+\label{sec:vtrace}
+
+When data are collected asynchronously, or when multiple gradient steps are taken over
+the same batch, the policy that collected the data ($\piold$) may differ from the
+current policy $\pith$.  V-Trace \cite{espeholt2018impala} corrects for this
+off-policyness by incorporating importance weights into the advantage computation.
+
+Define the clipped importance ratios
+\begin{align}
+  \rho_t &= \min\!\left(\bar{\rho},\; \frac{\pith(a_t \mid s_t)}{\piold(a_t \mid s_t)}\right),
+  \label{eq:rho}\\
+  c_t    &= \min\!\left(\bar{c},\;   \frac{\pith(a_t \mid s_t)}{\piold(a_t \mid s_t)}\right).
+  \label{eq:c}
+\end{align}
+The V-Trace target value is
+\begin{equation}
+  v_t = V(s_t) + \sum_{k=t}^{t+n-1} \gamma^{k-t}
+        \left(\prod_{i=t}^{k-1} c_i\right) \rho_k\,
+        \delta_k,
+  \label{eq:vtrace_target}
+\end{equation}
+where $\delta_k = r_{k+1} + \gamma V(s_{k+1}) - V(s_k)$ is the one-step TD error.
+
+PufferLib unifies GAE (Eq.~\ref{eq:gae}) and V-Trace (Eq.~\ref{eq:vtrace_target}) into
+a single backward pass.  Inspecting the CUDA kernel in
+\texttt{pufferlib/extensions/cuda/pufferlib.cu} (lines 7--20):
+
+\begin{lstlisting}[style=cstyle,
+  caption={Unified GAE + V-Trace advantage kernel (CUDA, \texttt{pufferlib/extensions/cuda/pufferlib.cu}, lines 7--20).}]
+__host__ __device__ void puff_advantage_row_cuda(
+        float* values, float* rewards, float* dones,
+        float* importance, float* advantages,
+        float gamma, float lambda,
+        float rho_clip, float c_clip, int horizon) {
+    float lastpufferlam = 0;
+    for (int t = horizon-2; t >= 0; t--) {
+        int t_next = t + 1;
+        float nextnonterminal = 1.0 - dones[t_next];
+        float rho_t = fminf(importance[t], rho_clip);   // Eq. (16)
+        float c_t   = fminf(importance[t], c_clip);     // Eq. (17)
+        float delta = rho_t * (rewards[t_next]
+                     + gamma * values[t_next] * nextnonterminal
+                     - values[t]);                       // rho-scaled TD error
+        lastpufferlam = delta
+                      + gamma * lambda * c_t
+                        * lastpufferlam * nextnonterminal;
+        advantages[t] = lastpufferlam;
+    }
+}
+\end{lstlisting}
+
+The recursion is a backward sweep over the horizon.  The \texttt{importance} buffer
+holds $\pi_\theta(a_t|s_t)/\pi_{\theta_\mathrm{old}}(a_t|s_t)$ ratios computed from the
+most recent forward pass.  An identical CPU fallback lives in
+\texttt{pufferlib/extensions/pufferlib.cpp} (lines 28--41).
+
+The function is invoked in the training loop (\texttt{pufferl.py}, lines 354--356):
+
+\begin{lstlisting}[style=pythonstyle,
+  caption={Advantage computation call in \texttt{pufferlib/pufferl.py} (lines 352--356).}]
+shape = self.values.shape
+advantages = torch.zeros(shape, device=device)
+advantages = compute_puff_advantage(
+    self.values, self.rewards,
+    self.terminals, self.ratio, advantages,
+    config['gamma'], config['gae_lambda'],
+    config['vtrace_rho_clip'], config['vtrace_c_clip'])
+\end{lstlisting}
+
+Relevant configuration values (from \texttt{pufferlib/config/default.ini}):
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  Parameter & Default & Description \\
+  \midrule
+  \texttt{gamma}          & $0.995$ & Discount factor $\gamma$ \\
+  \texttt{gae\_lambda}    & $0.90$  & GAE $\lambda$ \\
+  \texttt{vtrace\_rho\_clip} & $1.0$ & $\bar{\rho}$ in Eq.~\eqref{eq:rho} \\
+  \texttt{vtrace\_c\_clip}   & $1.0$ & $\bar{c}$    in Eq.~\eqref{eq:c}  \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{remark}
+  With \texttt{vtrace\_rho\_clip} = \texttt{vtrace\_c\_clip} = 1 the clipping has
+  little effect (ratios are at most 1 before any update), making the estimator
+  essentially equivalent to standard GAE immediately after data collection.  The
+  clipping becomes meaningful when multiple gradient epochs are performed over the
+  same batch (\texttt{update\_epochs} $> 1$), where the policy has already moved away
+  from the behaviour policy.
+\end{remark}
+
+\subsection{Priority Experience Replay}
+\label{sec:per}
+
+Rather than sampling minibatches uniformly, PufferLib assigns a probability to each
+trajectory segment proportional to the magnitude of its advantage:
+\begin{equation}
+  p_i \propto |A_i|^\alpha + \epsilon,
+  \label{eq:per}
+\end{equation}
+where $\alpha$ controls the degree of prioritisation and $\epsilon$ is a small floor.
+
+To correct for the induced sampling bias, importance-sampling weights
+\begin{equation}
+  w_i = \left(N \cdot p_i\right)^{-\beta}
+\end{equation}
+are annealed from $\beta_0$ towards 1 over training.  The implementation is in
+\texttt{pufferl.py} (lines 358--363):
+
+\begin{lstlisting}[style=pythonstyle,
+  caption={Priority sampling in \texttt{pufferlib/pufferl.py} (lines 358--363).}]
+# Prioritize experience by advantage magnitude
+adv = advantages.abs().sum(axis=1)
+prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
+idx = torch.multinomial(prio_probs, self.minibatch_segments)
+mb_prio = (self.segments * prio_probs[idx, None])**-anneal_beta
+\end{lstlisting}
+
+The minibatch advantages are then reweighted before the loss computation:
+
+\begin{lstlisting}[style=pythonstyle,
+  caption={Priority-weighted advantage normalisation (\texttt{pufferl.py}, lines 407--409).}]
+adv = mb_advantages
+adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+\end{lstlisting}
+
+Relevant configuration values:
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  Parameter & Default & Description \\
+  \midrule
+  \texttt{prio\_alpha}  & $0.8$ & Prioritisation exponent $\alpha$ \\
+  \texttt{prio\_beta0}  & $0.2$ & Initial IS correction $\beta_0$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Clipped Surrogate and Value Losses}
+\label{sec:clip_impl}
+
+The PPO clipped surrogate objective (Eq.~\ref{eq:clip}) is implemented directly
+in \texttt{pufferl.py} (lines 411--420):
+
+\begin{lstlisting}[style=pythonstyle,
+  caption={PPO clipped policy and value losses (\texttt{pufferl.py}, lines 411--420).}]
+# Policy gradient loss
+pg_loss1 = -adv * ratio                                      # unclipped
+pg_loss2 = -adv * torch.clamp(ratio,
+                               1 - clip_coef, 1 + clip_coef) # clipped
+pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+# Value function loss (with clipping)
+newvalue = newvalue.view(mb_returns.shape)
+v_clipped = mb_values + torch.clamp(
+    newvalue - mb_values, -vf_clip, vf_clip)
+v_loss_unclipped = (newvalue - mb_returns) ** 2
+v_loss_clipped   = (v_clipped - mb_returns) ** 2
+v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+\end{lstlisting}
+
+The total loss combines all three terms (line 424):
+
+\begin{lstlisting}[style=pythonstyle,
+  caption={Combined PPO loss (\texttt{pufferl.py}, line 424).}]
+loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+\end{lstlisting}
+
+Relevant configuration values:
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  Parameter & Default & Description \\
+  \midrule
+  \texttt{clip\_coef}    & $0.2$  & $\varepsilon$ in Eq.~\eqref{eq:clip} \\
+  \texttt{vf\_clip\_coef}& $0.2$  & Value function clipping coefficient \\
+  \texttt{vf\_coef}      & $2.0$  & $c_\mathrm{VF}$ in Eq.~\eqref{eq:ppo_full} \\
+  \texttt{ent\_coef}     & $0.001$& $c_\mathrm{ENT}$ in Eq.~\eqref{eq:ppo_full} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Gradient Clipping and Learning Rate Schedule}
+
+After computing the loss, gradients are accumulated over \texttt{accumulate\_minibatches}
+steps and then clipped before the optimiser step (\texttt{pufferl.py}, lines 442--446):
+
+\begin{lstlisting}[style=pythonstyle,
+  caption={Gradient clipping (\texttt{pufferl.py}, lines 442--446).}]
+loss.backward()
+if (mb + 1) % self.accumulate_minibatches == 0:
+    torch.nn.utils.clip_grad_norm_(
+        self.policy.parameters(), config['max_grad_norm'])
+    self.optimizer.step()
+    self.optimizer.zero_grad()
+\end{lstlisting}
+
+The learning rate is linearly annealed from \texttt{learning\_rate} to
+\texttt{min\_lr\_ratio} $\times$ \texttt{learning\_rate} over the course of training
+(controlled by a \texttt{CosineAnnealingLR} or linear scheduler, configured via
+\texttt{anneal\_lr}).
+
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  Parameter & Default & Description \\
+  \midrule
+  \texttt{max\_grad\_norm} & $1.5$   & Gradient clip norm \\
+  \texttt{learning\_rate}  & $0.015$ & Initial Adam learning rate \\
+  \texttt{anneal\_lr}      & True    & Enable LR annealing \\
+  \texttt{min\_lr\_ratio}  & $0.0$   & Final LR as fraction of initial \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+% ---------------------------------------------------------------------------
+\section{Training Diagnostics: Understanding the Log}
+\label{sec:log}
+% ---------------------------------------------------------------------------
+
+PufferLib prints and logs a dashboard of scalar metrics after each update.  The
+relevant quantities are computed in \texttt{pufferl.py} (lines 396--457) and prefixed
+with \texttt{losses/} when sent to Wandb or Neptune.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{p{3.4cm} p{5.2cm} p{5.8cm}}
+  \toprule
+  \textbf{Metric} & \textbf{Formula / source} & \textbf{Interpretation} \\
+  \midrule
+  \texttt{policy\_loss}
+    & $\E_t[\max(\ldots)]$ (lines 412--414)
+    & PPO clipped policy gradient loss.  Magnitude alone is not diagnostic; watch for
+      trends or spikes.\\
+
+  \texttt{value\_loss}
+    & $0.5\,\E_t[\max(v^2_\mathrm{unc}, v^2_\mathrm{clip})]$ (lines 418--420)
+    & Critic MSE.  Should decrease over training. \\
+
+  \texttt{entropy}
+    & $\E_t[H[\pi_\theta(\cdot|s_t)]]$ (line 422)
+    & Policy entropy.  Too low $\Rightarrow$ premature convergence / insufficient
+      exploration. \\
+
+  \texttt{old\_approx\_kl}
+    & $\E_t[-\log r_t(\theta)]$ (line 397)
+    & First-order KL approximation using the old ratio.  Should be small. \\
+
+  \texttt{approx\_kl}
+    & $\E_t[(r_t - 1) - \log r_t]$ (line 398)
+    & Second-order KL approximation (Jensen--Shannon style).  If consistently $\gg 0.01$,
+      consider reducing learning rate or increasing clipping.  Can be used for early
+      stopping. \\
+
+  \texttt{clipfrac}
+    & $\E_t[\mathbbm{1}(|r_t - 1| > \varepsilon)]$ (line 399)
+    & Fraction of timesteps where clipping is active.  Ideally $\sim 0.1$--$0.3$;
+      higher values indicate the policy is being updated too aggressively. \\
+
+  \texttt{importance}
+    & $\E_t[r_t(\theta)]$ (line 438)
+    & Mean importance ratio.  Should stay close to 1; large deviations indicate
+      significant policy drift within a batch. \\
+
+  \texttt{explained\_variance}
+    & $1 - \mathrm{Var}(\hat{R} - \hat{V})/\mathrm{Var}(\hat{R})$ (lines 453--456)
+    & Fraction of return variance explained by the critic.  Near 1 is ideal; near 0 or
+      negative means the critic is no better than a constant baseline. \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{remark}
+  A healthy training run typically shows: \texttt{explained\_variance} rising from near
+  zero to $> 0.9$; \texttt{entropy} slowly decreasing; \texttt{approx\_kl} staying
+  below $0.02$; and \texttt{clipfrac} in the range $0.1$--$0.3$.  Divergence in
+  \texttt{value\_loss} coupled with a drop in \texttt{explained\_variance} is often an
+  early warning of instability.
+\end{remark}
+
+% ---------------------------------------------------------------------------
+\section{Summary}
+\label{sec:summary}
+% ---------------------------------------------------------------------------
+
+\begin{enumerate}
+  \item The utility $J(\theta)$ is the expected discounted return under $\pi_\theta$.
+  \item The policy gradient theorem (REINFORCE) expresses $\nabla_\theta J$ as the
+        expectation of the score function times the return.
+  \item Variance is reduced through reward-to-go, baseline subtraction, and GAE.
+  \item TRPO constrains the KL divergence to prevent catastrophic policy updates but
+        requires second-order optimisation.
+  \item PPO replaces the hard KL constraint with a clipped surrogate objective,
+        enabling first-order optimisation while retaining stability.
+  \item PufferLib extends PPO with a unified GAE + V-Trace advantage kernel, priority
+        experience replay, clipped value loss, gradient accumulation, and learning rate
+        annealing.  All algorithmic components are concentrated in
+        \texttt{pufferlib/pufferl.py} and
+        \texttt{pufferlib/extensions/cuda/pufferlib.cu}.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+% References
+% ---------------------------------------------------------------------------
+
+\begin{thebibliography}{99}
+
+\bibitem{schulman2015trpo}
+Schulman, J., Levine, S., Moritz, P., Jordan, M., \& Abbeel, P. (2015).
+\textit{Trust Region Policy Optimization}.
+In \textit{Proceedings of ICML 2015}, pp.\ 1889--1897.
+
+\bibitem{schulman2016gae}
+Schulman, J., Moritz, P., Levine, S., Jordan, M., \& Abbeel, P. (2016).
+\textit{High-Dimensional Continuous Control Using Generalized Advantage Estimation}.
+In \textit{Proceedings of ICLR 2016}.
+
+\bibitem{schulman2017ppo}
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., \& Klimov, O. (2017).
+\textit{Proximal Policy Optimization Algorithms}.
+arXiv preprint arXiv:1707.06347.
+
+\bibitem{espeholt2018impala}
+Espeholt, L., Soyer, H., Munos, R., Simonyan, K., Mnih, V., Ward, T., \ldots \& Kavukcuoglu, K. (2018).
+\textit{IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures}.
+In \textit{Proceedings of ICML 2018}, pp.\ 1407--1416.
+
+\bibitem{schaul2016per}
+Schaul, T., Quan, J., Antonoglou, I., \& Silver, D. (2016).
+\textit{Prioritized Experience Replay}.
+In \textit{Proceedings of ICLR 2016}.
+
+\end{thebibliography}
+
+\end{document}
