@@ -1,0 +1,189 @@
+PufferLib PPO Training Cycle — Memory Layout and Data Flow
+===========================================================
+
+
+ASCII Diagram
+-------------
+
+═══════════════════════════════════════════════════════════════════════════
+  SHARED MEMORY  (multiprocessing.RawArray, pageable CPU heap)
+  Visible to all processes without copying. Layout: [num_workers × ...]
+═══════════════════════════════════════════════════════════════════════════
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  observations  [W × A × obs_shape]   W = num_workers               │
+  │  actions       [W × A × atn_shape]   A = agents_per_worker         │
+  │  rewards       [W × A]                                             │
+  │  terminals     [W × A]                                             │
+  │  semaphores    [W]   (RESET / STEP / MAIN / INFO / CLOSE)          │
+  └──────┬──────────────────────────────────────┬───────────────────────┘
+         │ each worker owns one row             │ zero-copy numpy view
+         │                                      │
+  ┌──────▼──────────────────┐          ┌────────▼──────────────────────────┐
+  │  Worker Process 0        │          │         Main Process               │
+  │  (pinned to 1 CPU core)  │          │                                   │
+  │                          │          │  1. vecenv.recv()                  │
+  │  envs[0 .. K-1]          │─ MAIN ──►│     waits for workers_per_batch   │
+  │  c_step() writes         │          │     workers to set sem=MAIN        │
+  │  obs/reward/terminal     │          │     returns numpy views into shm   │
+  │  directly into shm[0,:]  │◄─ STEP ─│                                   │
+  └──────────────────────────┘          │  2. torch.as_tensor(obs)          │
+        ↑  ↓  (concurrent)              │     .to('cuda')  ─────────────►  GPU
+  ┌──────────────────────────┐          │                                   │
+  │  Worker Process 1        │─ MAIN ──►│  3. policy.forward_eval(obs_gpu)  │
+  │                          │          │     ◄── logits, value ──────────  GPU
+  │  envs[K .. 2K-1]         │          │                  ↑                │
+  │  c_step() writes         │◄─ STEP ─│     runs concurrently with        │
+  │  obs/reward/terminal     │          │     c_step() in worker processes  │
+  │  into shm[1,:]           │          │                                   │
+  └──────────────────────────┘          │  4. sample_logits(logits)         │
+        ↑  ↓  (concurrent)              │     ◄── action, logprob ────────  GPU
+            ...                         │                                   │
+  ┌──────────────────────────┐          │  5. action.cpu().numpy()          │
+  │  Worker Process W-1      │─ MAIN ──►│     vecenv.send(action)           │
+  │  envs[(W-1)K .. WK-1]   │◄─ STEP ─│     writes into shm actions row   │
+  └──────────────────────────┘          │     sets semaphores[w] = STEP     │
+                                        └───────────────────────────────────┘
+                                                        │
+                              steps 1–5 repeat until all segment rows are full
+                                                        │
+                                                        ▼
+═══════════════════════════════════════════════════════════════════════════
+  TRAJECTORY BUFFER  (GPU tensors, or CPU pinned if cpu_offload=True)
+  Shape: (segments, horizon)   where segments = batch_size / bptt_horizon
+                                     = total_agents  (with default batch_size)
+═══════════════════════════════════════════════════════════════════════════
+
+  Allocated once. Filled column by column each collect phase.
+
+  ep_indices[env_id] = which segment row the current agent-batch writes to
+  ep_lengths[env_id] = current timestep l within that row  (0 .. horizon-1)
+
+                l=0   l=1   l=2   ...  l=63
+              ┌─────┬─────┬─────┬─────┬─────┐
+  segment  0  │ obs │ obs │ obs │ ... │ obs │  ← agent-batch 0 fills this row
+              ├─────┼─────┼─────┼─────┼─────┤
+  segment  1  │ obs │ obs │ obs │ ... │ obs │  ← agent-batch 1
+              ├─────┼─────┼─────┼─────┼─────┤
+      ...     │ ... │ ... │ ... │ ... │ ... │
+              ├─────┼─────┼─────┼─────┼─────┤
+  segment S-1 │ obs │ obs │ obs │ ... │ obs │  ← last agent-batch
+              └─────┴─────┴─────┴─────┴─────┘
+
+  Same layout exists for: actions, logprobs, values, rewards, terminals, ratio
+
+  At each recv()/send() cycle:
+    buffer[ep_indices[env_id], l]  ←  obs, action, logprob, value, reward, terminal
+    ep_lengths[env_id] += 1
+    if l+1 == horizon:
+        full_rows += agents_per_batch
+        ep_indices[env_id] ← next free rows  (free_idx counter)
+
+  Loop continues until full_rows >= segments
+                                                        │
+                                                        ▼
+═══════════════════════════════════════════════════════════════════════════
+  TRAIN PHASE  (all on GPU)
+═══════════════════════════════════════════════════════════════════════════
+
+  Trajectory buffer (segments × horizon)
+          │
+          ▼
+  compute_puff_advantage()     [CUDA kernel, pufferlib/extensions/cuda/]
+  → advantages  (segments × horizon)
+          │
+          ▼
+  Priority sampling
+    |advantages|.sum(axis=1)  → magnitude per segment
+    prio_probs  ∝  magnitude ^ alpha
+    idx = torch.multinomial(prio_probs, minibatch_segments)   [with replacement]
+          │
+          ├── mb_obs        = observations[idx]   (minibatch_segments × horizon × obs_shape)
+          ├── mb_actions    = actions[idx]
+          ├── mb_logprobs   = logprobs[idx]        ← old policy's log-probs
+          ├── mb_values     = values[idx]           ← old critic's predictions
+          └── mb_advantages = advantages[idx]
+                    │
+                    ▼
+          reshape → (minibatch_size, obs_shape)
+                    │
+                    ▼
+          policy(mb_obs) → new_logits, new_value   [forward pass, GPU]
+                    │
+                    ▼
+          ratio = exp(new_logprob - mb_logprobs)
+          pg_loss = max(-adv·ratio,  -adv·clip(ratio, 1-ε, 1+ε)) .mean()
+          v_loss  = 0.5·max((V_new - R)², (clip(V_new) - R)²) .mean()
+          loss    = pg_loss  +  vf_coef·v_loss  -  ent_coef·entropy
+                    │
+                    ▼
+          loss.backward()
+          clip_grad_norm_(policy.parameters(), max_grad_norm)
+          optimizer.step()
+
+  Repeated for total_minibatches = update_epochs × batch_size / minibatch_size
+
+
+Supporting Paragraphs
+---------------------
+
+Shared memory and worker processes. The vectorization layer (vector.py:300-309)
+allocates one flat RawArray per buffer type — observations, actions, rewards,
+terminals, etc. — on the CPU heap. These arrays are laid out as
+[num_workers × agents_per_worker × ...] and are mapped as numpy ndarray views
+in both the main process and in every worker process, so there is no
+serialisation or copying between processes. One worker process is spawned per
+physical CPU core (vector.py:262), and each worker owns a contiguous row of the
+shared memory corresponding to its envs_per_worker environments. The C
+environment's c_step() function receives raw pointers into this shared memory
+(set up via the C binding layer) and writes observations, rewards, and terminals
+directly in-place, never allocating new memory.
+
+The semaphore loop. Worker and main process synchronise through a semaphores
+RawArray (vector.py:195-224). After c_step() completes, the worker sets
+semaphores[worker_idx] = MAIN. The main process polls these semaphores in
+recv() (vector.py:356-445) and waits until workers_per_batch workers have
+raised their flags. Because both processes share the same memory, recv() returns
+zero-copy numpy views directly into the shared observation rows — no data is
+moved across a pipe. The main process then writes the chosen actions back into
+the shared actions buffer and sets semaphores[w] = STEP, releasing the worker
+to call c_step() again while the main process begins the policy forward pass.
+
+The trajectory buffer. The main process maintains a separate set of GPU tensors
+called the trajectory buffer (pufferl.py:95-110), shaped (segments, horizon, ...)
+where segments = batch_size / bptt_horizon. With default settings
+batch_size = total_agents × bptt_horizon, so segments = total_agents. This
+buffer is what accumulates the full rollout before training. Two index arrays
+manage the fill process: ep_indices[env_id] records which segment row a given
+agent-batch currently writes into, and ep_lengths[env_id] records how many
+timesteps have been written into that row so far. At each recv/send cycle the
+main process copies the current observations, computed actions, log-probabilities,
+critic values, rewards, and terminals into column l = ep_lengths of the assigned
+rows (pufferl.py:284-296). When a row reaches horizon timesteps it is marked
+full and, if more segments remain to fill, the agent-batch is assigned a new row.
+The collect loop runs until full_rows >= segments (pufferl.py:244).
+
+Moving data to the GPU. The shared memory observations arrive in the main process
+as a pageable CPU numpy array. The main process converts them with
+torch.as_tensor() (zero-copy, still on CPU) and then calls .to(device) to move
+them to the GPU (pufferl.py:255-256). This triggers a CUDA host-to-device
+transfer — because the memory is pageable (not pinned), the CUDA driver
+internally stages it through a temporary pinned buffer before DMA. The
+cpu_offload option (pufferl.py:287-290) avoids this by keeping observations in
+CPU pinned memory throughout the trajectory buffer and only transferring the
+minibatch slice at train time, which can be worthwhile when the observation
+tensor is large.
+
+The train phase. Once the trajectory buffer is full, training begins
+(pufferl.py:332-476). The unified GAE + V-Trace advantage kernel runs on the
+GPU over the full (segments, horizon) buffer, producing an advantage estimate
+for every timestep. Priority sampling then draws minibatch_segments segment
+indices with replacement, weighted by total advantage magnitude per segment.
+The selected rows are gathered into a minibatch, reshaped from
+(minibatch_segments, horizon, obs_shape) to (minibatch_size, obs_shape), and
+fed through a full policy forward pass to obtain new log-probabilities and
+values. The PPO clipped surrogate loss, clipped value loss, and entropy bonus
+are combined, backpropagated, and the gradient step is taken, with gradient
+clipping applied before the optimiser step. This entire train phase operates
+exclusively on GPU tensors; no data moves back to CPU until the next collect
+phase begins.
