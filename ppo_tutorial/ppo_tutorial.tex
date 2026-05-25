@@ -275,7 +275,11 @@ An \emph{actor-critic} method goes one step further by letting the critic
   \hat{A}_t^{\mathrm{TD}} = r_{t+1} + \gamma V_\phi(s_{t+1})(1 - d_{t+1}) - V_\phi(s_t),
   \label{eq:td_adv}
 \end{equation}
-where $V_\phi$ is the learned critic.  Both components are trained concurrently:
+where $V_\phi$ is the learned critic and $d_{t+1} \in \{0, 1\}$ is a binary flag
+indicating whether $s_{t+1}$ is a terminal state (i.e.\ the episode ended after
+taking action $a_t$).  When $d_{t+1} = 1$ the bootstrapped term
+$\gamma V_\phi(s_{t+1})$ is zeroed out, because there is no future return beyond
+a terminal state.  Both components are trained concurrently:
 the actor maximises expected return via the policy gradient, while the critic
 minimises a regression loss against TD targets.
 
@@ -316,7 +320,10 @@ the GAE estimator is
   \label{eq:gae}
 \end{equation}
 where $\delta_t = r_{t+1} + \gamma V(s_{t+1})(1 - d_{t+1}) - V(s_t)$ is the
-one-step TD residual and $d_{t+1} \in \{0,1\}$ indicates episode termination.
+one-step TD residual.  The flag $d_{t+1} \in \{0, 1\}$ is 1 if the episode
+terminated at step $t{+}1$ and 0 otherwise; the factor $(1 - d_{t+1})$ zeroes
+out the bootstrapped value $\gamma V(s_{t+1})$ at episode boundaries so that
+returns do not bleed across episodes.
 
 Setting $\lambda = 0$ recovers the TD(0) advantage (high bias, low variance);
 $\lambda = 1$ recovers the Monte-Carlo advantage (low bias, high variance).
