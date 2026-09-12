@@ -1,35 +1,15 @@
-/**
- * @fileoverview OSRS-style GUI panel system for the debug viewer.
- *
- * Renders inventory, equipment, prayer, combat, and spellbook panels
- * using real sprites exported from the OSRS cache (index 8). Tab bar
- * at the TOP matches the real OSRS fixed-mode client (7 tabs).
- *
- * Sprite sources (exported by scripts/export_sprites_modern.py):
- *   - equipment slot backgrounds: sprite IDs 156-165, 170
- *   - prayer icons (enabled/disabled): sprite IDs 115-154, 502-509, 945-951, 1420-1425
- *   - tab icons: sprite IDs 168, 898, 899, 900, 901, 779, 780
- *   - spell icons: sprite IDs 325-348, 375-398, 557, 561, 564, 607, 611, 614
- *   - special attack bar: sprite ID 657
- *
- * Layout constants derived from OSRS client widget definitions:
- *   - inventory: 4 columns x 7 rows, 36x32 item sprites
- *   - equipment: 11 slots in paperdoll layout (interface 387)
- *   - prayer: 5 columns x 6 rows grid (interface 541)
- *   - combat: 4 attack style buttons + special bar (interface 593)
- *   - spellbook: grid layout (interface 218)
- */
-
 #ifndef OSRS_GUI_H
 #define OSRS_GUI_H
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "osrs_asset_raylib.h"
 #include "osrs_human_input_types.h"
+#include "osrs_inventory_drag.h"
 
 #if __has_include("raylib.h")
 #include "raylib.h"
@@ -41,30 +21,19 @@
 #include "osrs_types.h"
 #include "osrs_items.h"
 #include "osrs_pvp_gear.h"
+#include "osrs_inventory_clicks.h"
 #include "osrs_ui_interfaces.h"
 
-
 #define GUI_BG_DARK     CLITERAL(Color){ 62, 53, 41, 255 }
-#define GUI_BG_MEDIUM   CLITERAL(Color){ 75, 67, 54, 255 }
 #define GUI_BG_SLOT     CLITERAL(Color){ 56, 48, 38, 255 }
-#define GUI_BG_SLOT_HL  CLITERAL(Color){ 90, 80, 60, 255 }
 #define GUI_BORDER      CLITERAL(Color){ 42, 36, 28, 255 }
 #define GUI_BORDER_LT   CLITERAL(Color){ 100, 90, 70, 255 }
 #define GUI_TEXT_YELLOW  CLITERAL(Color){ 255, 255, 0, 255 }
 #define GUI_TEXT_ORANGE  CLITERAL(Color){ 255, 152, 31, 255 }
 #define GUI_TEXT_WHITE   CLITERAL(Color){ 255, 255, 255, 255 }
 #define GUI_TEXT_GREEN   CLITERAL(Color){ 0, 255, 0, 255 }
-#define GUI_TEXT_RED     CLITERAL(Color){ 255, 0, 0, 255 }
-#define GUI_TEXT_CYAN    CLITERAL(Color){ 0, 255, 255, 255 }
-#define GUI_TAB_ACTIVE   CLITERAL(Color){ 100, 90, 70, 255 }
-#define GUI_TAB_INACTIVE CLITERAL(Color){ 50, 44, 35, 255 }
-#define GUI_PRAYER_ON   CLITERAL(Color){ 200, 200, 100, 80 }
 #define GUI_SPEC_GREEN  CLITERAL(Color){ 0, 180, 0, 255 }
-#define GUI_SPEC_DARK   CLITERAL(Color){ 30, 30, 20, 255 }
-#define GUI_HP_GREEN    CLITERAL(Color){ 0, 146, 0, 255 }
-#define GUI_HP_RED      CLITERAL(Color){ 160, 0, 0, 255 }
 
-/* OSRS text shadow: draw black at (+1,+1) then color on top */
 #define GUI_TEXT_SHADOW CLITERAL(Color){ 0, 0, 0, 255 }
 
 #define GUI_MAP_CONTAINER_W 211
@@ -86,8 +55,6 @@
 
 #define GUI_ORBS_X 0
 #define GUI_ORBS_Y 10
-#define GUI_ORBS_W 207
-#define GUI_ORBS_H 197
 #define GUI_XP_X 0
 #define GUI_XP_Y 17
 #define GUI_HP_X 0
@@ -102,7 +69,6 @@
 #define GUI_WORLDMAP_Y 137
 
 #define GUI_SIDE_MENU_W 241
-#define GUI_SIDE_MENU_H 335
 #define GUI_SIDE_CONTENT_X 25
 #define GUI_SIDE_CONTENT_Y 37
 #define GUI_SIDE_CONTENT_W 190
@@ -112,11 +78,10 @@
 
 #define GUI_TAB_PRESS_TICKS 6
 
-
 typedef enum {
     GUI_TAB_COMBAT = 0,
-    GUI_TAB_STATS = 1,       /* empty (no content) */
-    GUI_TAB_QUESTS = 2,      /* empty (no content) */
+    GUI_TAB_STATS = 1,
+    GUI_TAB_QUESTS = 2,
     GUI_TAB_INVENTORY = 3,
     GUI_TAB_EQUIPMENT = 4,
     GUI_TAB_PRAYER = 5,
@@ -124,101 +89,85 @@ typedef enum {
     GUI_TAB_COUNT = 7
 } GuiTab;
 
+#define GUI_NUM_SLOT_SPRITES 12
 
-/* slot background sprite IDs from cache index 8:
-   head=156, cape=157, neck=158, weapon=159, ring=160,
-   body=161, shield=162, legs=163, hands=164, feet=165, tile=170 */
-#define GUI_NUM_SLOT_SPRITES 12  /* 11 slots + tile background */
-
-
-/* prayer icons — authoritative 29-entry standard book.
-   enum order IS display order (left→right, top→bottom) in the 5×6 grid.
-   sprite IDs match the real OSRS SpriteID.Prayeron / Prayeroff mapping. */
 typedef enum {
-    GUI_PRAY_THICK_SKIN = 0,      /* row 0: sprite 115 / 135 */
-    GUI_PRAY_BURST_STR,           /*        sprite 116 / 136 */
-    GUI_PRAY_CLARITY,             /*        sprite 117 / 137 */
-    GUI_PRAY_SHARP_EYE,           /*        sprite 133 / 153 */
-    GUI_PRAY_MYSTIC_WILL,         /*        sprite 134 / 154 */
-    GUI_PRAY_ROCK_SKIN,           /* row 1: sprite 118 / 138 */
-    GUI_PRAY_SUPERHUMAN,          /*        sprite 119 / 139 */
-    GUI_PRAY_IMPROVED_REFLEX,     /*        sprite 120 / 140 */
-    GUI_PRAY_RAPID_RESTORE,       /*        sprite 121 / 141 */
-    GUI_PRAY_RAPID_HEAL,          /*        sprite 122 / 142 */
-    GUI_PRAY_PROTECT_ITEM,        /* row 2: sprite 123 / 143 */
-    GUI_PRAY_HAWK_EYE,            /*        sprite 502 / 506 */
-    GUI_PRAY_MYSTIC_LORE,         /*        sprite 503 / 507 */
-    GUI_PRAY_STEEL_SKIN,          /*        sprite 124 / 144 */
-    GUI_PRAY_ULTIMATE_STR,        /*        sprite 125 / 145 */
-    GUI_PRAY_INCREDIBLE_REFLEX,   /* row 3: sprite 126 / 146 */
-    GUI_PRAY_PROTECT_MAGIC,       /*        sprite 127 / 147 */
-    GUI_PRAY_PROTECT_MISSILES,    /*        sprite 128 / 148 */
-    GUI_PRAY_PROTECT_MELEE,       /*        sprite 129 / 149 */
-    GUI_PRAY_EAGLE_EYE,           /*        sprite 504 / 508 */
-    GUI_PRAY_MYSTIC_MIGHT,        /* row 4: sprite 505 / 509 */
-    GUI_PRAY_RETRIBUTION,         /*        sprite 131 / 151 */
-    GUI_PRAY_REDEMPTION,          /*        sprite 130 / 150 */
-    GUI_PRAY_SMITE,               /*        sprite 132 / 152 */
-    GUI_PRAY_PRESERVE,            /*        sprite 947 / 951 */
-    GUI_PRAY_CHIVALRY,            /* row 5: sprite 945 / 949 */
-    GUI_PRAY_PIETY,               /*        sprite 946 / 950 */
-    GUI_PRAY_RIGOUR,              /*        sprite 1420 / 1424 */
-    GUI_PRAY_AUGURY,              /*        sprite 1421 / 1425 */
-    GUI_NUM_PRAYERS               /* = 29 */
+    GUI_PRAY_THICK_SKIN = 0,
+    GUI_PRAY_BURST_STR,
+    GUI_PRAY_CLARITY,
+    GUI_PRAY_SHARP_EYE,
+    GUI_PRAY_MYSTIC_WILL,
+    GUI_PRAY_ROCK_SKIN,
+    GUI_PRAY_SUPERHUMAN,
+    GUI_PRAY_IMPROVED_REFLEX,
+    GUI_PRAY_RAPID_RESTORE,
+    GUI_PRAY_RAPID_HEAL,
+    GUI_PRAY_PROTECT_ITEM,
+    GUI_PRAY_HAWK_EYE,
+    GUI_PRAY_MYSTIC_LORE,
+    GUI_PRAY_STEEL_SKIN,
+    GUI_PRAY_ULTIMATE_STR,
+    GUI_PRAY_INCREDIBLE_REFLEX,
+    GUI_PRAY_PROTECT_MAGIC,
+    GUI_PRAY_PROTECT_MISSILES,
+    GUI_PRAY_PROTECT_MELEE,
+    GUI_PRAY_EAGLE_EYE,
+    GUI_PRAY_MYSTIC_MIGHT,
+    GUI_PRAY_RETRIBUTION,
+    GUI_PRAY_REDEMPTION,
+    GUI_PRAY_SMITE,
+    GUI_PRAY_PRESERVE,
+    GUI_PRAY_CHIVALRY,
+    GUI_PRAY_PIETY,
+    GUI_PRAY_RIGOUR,
+    GUI_PRAY_AUGURY,
+    GUI_NUM_PRAYERS
 } GuiPrayerIdx;
 
-
-/* Ancient spellbook sorted by level: combat spells followed by teleports. */
 typedef enum {
-    GUI_SPELL_SMOKE_RUSH = 0,     /* sprite 329 / 379 */
-    GUI_SPELL_SHADOW_RUSH,        /* sprite 337 / 387 */
-    GUI_SPELL_BLOOD_RUSH,         /* sprite 333 / 383 */
-    GUI_SPELL_ICE_RUSH,           /* sprite 325 / 375 */
-    GUI_SPELL_SMOKE_BURST,        /* sprite 330 / 380 */
-    GUI_SPELL_SHADOW_BURST,       /* sprite 338 / 388 */
-    GUI_SPELL_BLOOD_BURST,        /* sprite 334 / 384 */
-    GUI_SPELL_ICE_BURST,          /* sprite 326 / 376 */
-    GUI_SPELL_SMOKE_BLITZ,        /* sprite 331 / 381 */
-    GUI_SPELL_SHADOW_BLITZ,       /* sprite 339 / 389 */
-    GUI_SPELL_BLOOD_BLITZ,        /* sprite 335 / 385 */
-    GUI_SPELL_ICE_BLITZ,          /* sprite 327 / 377 */
-    GUI_SPELL_SMOKE_BARRAGE,      /* sprite 332 / 382 */
-    GUI_SPELL_SHADOW_BARRAGE,     /* sprite 340 / 390 */
-    GUI_SPELL_BLOOD_BARRAGE,      /* sprite 336 / 386 */
-    GUI_SPELL_ICE_BARRAGE,        /* sprite 328 / 378 */
-    GUI_SPELL_PADDEWWA_TELEPORT,   /* sprite 341 / 391 */
-    GUI_SPELL_SENNTISTEN_TELEPORT, /* sprite 342 / 392 */
-    GUI_SPELL_KHARYRLL_TELEPORT,   /* sprite 343 / 393 */
-    GUI_SPELL_LASSAR_TELEPORT,     /* sprite 344 / 394 */
-    GUI_SPELL_DAREEYAK_TELEPORT,   /* sprite 345 / 395 */
-    GUI_SPELL_CARRALLANGER_TELEPORT, /* sprite 346 / 396 */
-    GUI_SPELL_ANNAKARL_TELEPORT,   /* sprite 347 / 397 */
-    GUI_SPELL_GHORROCK_TELEPORT,   /* sprite 348 / 398 */
-    GUI_SPELL_VENGEANCE,          /* sprite 564 */
+    GUI_SPELL_SMOKE_RUSH = 0,
+    GUI_SPELL_SHADOW_RUSH,
+    GUI_SPELL_BLOOD_RUSH,
+    GUI_SPELL_ICE_RUSH,
+    GUI_SPELL_SMOKE_BURST,
+    GUI_SPELL_SHADOW_BURST,
+    GUI_SPELL_BLOOD_BURST,
+    GUI_SPELL_ICE_BURST,
+    GUI_SPELL_SMOKE_BLITZ,
+    GUI_SPELL_SHADOW_BLITZ,
+    GUI_SPELL_BLOOD_BLITZ,
+    GUI_SPELL_ICE_BLITZ,
+    GUI_SPELL_SMOKE_BARRAGE,
+    GUI_SPELL_SHADOW_BARRAGE,
+    GUI_SPELL_BLOOD_BARRAGE,
+    GUI_SPELL_ICE_BARRAGE,
+    GUI_SPELL_PADDEWWA_TELEPORT,
+    GUI_SPELL_SENNTISTEN_TELEPORT,
+    GUI_SPELL_KHARYRLL_TELEPORT,
+    GUI_SPELL_LASSAR_TELEPORT,
+    GUI_SPELL_DAREEYAK_TELEPORT,
+    GUI_SPELL_CARRALLANGER_TELEPORT,
+    GUI_SPELL_ANNAKARL_TELEPORT,
+    GUI_SPELL_GHORROCK_TELEPORT,
     GUI_NUM_SPELLS
 } GuiSpellIdx;
 
-
-/* inventory slot types: either an equipment item (ITEM_DATABASE index) or a consumable.
-   consumables are tracked as counts in Player, not as individual ITEM_DATABASE entries,
-   so we use dedicated types with known OSRS item IDs for sprite lookup. */
 typedef enum {
     INV_SLOT_EMPTY = 0,
-    INV_SLOT_EQUIPMENT,     /* item_db_idx holds ITEM_DATABASE index */
-    INV_SLOT_FOOD,          /* shark (OSRS ID 385) */
-    INV_SLOT_KARAMBWAN,     /* cooked karambwan (OSRS ID 3144) */
-    INV_SLOT_BREW,          /* saradomin brew (OSRS IDs 6685/6687/6689/6691 for 4/3/2/1 dose) */
-    INV_SLOT_RESTORE,       /* super restore (OSRS IDs 3024/3026/3028/3030) */
-    INV_SLOT_COMBAT_POT,    /* super combat (OSRS IDs 12695/12697/12699/12701) */
-    INV_SLOT_RANGED_POT,    /* ranging potion (OSRS IDs 2444/169/171/173) */
-    INV_SLOT_ANTIVENOM,     /* anti-venom+ (OSRS IDs 12913/12915/12917/12919) */
-    INV_SLOT_PRAYER_POT,    /* prayer potion (OSRS IDs 2434/139/141/143 for 4/3/2/1 dose) */
-    INV_SLOT_BASTION_POT,   /* bastion potion (OSRS IDs 22461/22464/22467/22470) */
-    INV_SLOT_STAMINA_POT,   /* stamina potion (OSRS IDs 12625/12627/12629/12631) */
-    INV_SLOT_SATURATED_HEART, /* saturated heart (OSRS ID 27641) */
+    INV_SLOT_EQUIPMENT,
+    INV_SLOT_FOOD,
+    INV_SLOT_KARAMBWAN,
+    INV_SLOT_BREW,
+    INV_SLOT_RESTORE,
+    INV_SLOT_COMBAT_POT,
+    INV_SLOT_RANGED_POT,
+    INV_SLOT_ANTIVENOM,
+    INV_SLOT_PRAYER_POT,
+    INV_SLOT_BASTION_POT,
+    INV_SLOT_STAMINA_POT,
+    INV_SLOT_SATURATED_HEART,
 } InvSlotType;
 
-/* OSRS item IDs for consumable sprites (4-dose shown by default) */
 #define OSRS_ID_SHARK         385
 #define OSRS_ID_KARAMBWAN     3144
 #define OSRS_ID_BREW_4        6685
@@ -255,17 +204,15 @@ typedef enum {
 #define OSRS_ID_STAMINA_1     12631
 #define OSRS_ID_SATURATED_HEART 27641
 
-#define INV_GRID_SLOTS 28  /* 4 columns x 7 rows */
+#define INV_GRID_SLOTS 28
 
 typedef struct {
     InvSlotType type;
-    uint8_t     item_db_idx;   /* ITEM_DATABASE index (for INV_SLOT_EQUIPMENT) */
-    int         osrs_id;       /* OSRS item ID (for sprite lookup, all types) */
+    uint8_t     item_db_idx;
+    int         osrs_id;
 } InvSlot;
 
-/* click/drag interaction state */
-#define INV_DIM_TICKS 15       /* client ticks (50 Hz) to show dim after click */
-#define INV_DRAG_DEAD_ZONE 5   /* pixels before drag activates */
+#define INV_DIM_TICKS 15
 
 typedef enum {
     INV_ACTION_NONE = 0,
@@ -344,111 +291,57 @@ typedef struct {
     int panel_x, panel_y;
     int panel_w, panel_h;
     int tab_h;
-    int status_bar_h;    /* compact HP/prayer/spec bar height */
+    int status_bar_h;
 
-    /* multi-entity cycling (G key) */
+    float ui_scale;
+
     int gui_entity_idx;
     int gui_entity_count;
 
-    /* encounter state (for boss info display below panel) */
     void* encounter_state;
     const void* encounter_def;
 
-    /* textures loaded from exported cache sprites */
-    int sprites_loaded;
     GuiNamedAsset named_assets[GUI_MAX_NAMED_ASSETS];
     int named_asset_count;
     OsrsUiInterfaceStore ui_interfaces;
     Font font;
     Font small_font;
-    int font_loaded;
-    int small_font_loaded;
     GuiItemStackVariant item_stack_variants[GUI_ITEM_STACK_VARIANT_MAX];
     int item_stack_variant_count;
 
-    /* equipment slot background sprites (indexed by GEAR_SLOT_*) */
     Texture2D slot_sprites[GUI_NUM_SLOT_SPRITES];
-    Texture2D slot_tile_bg;   /* sprite 170: tile/background */
 
-    /* tab icons: 7 tabs (combat, stats, quests, inventory, equipment, prayer, spellbook) */
-    Texture2D tab_icons[GUI_TAB_COUNT];
     int tab_press_timer[GUI_TAB_COUNT];
 
-    /* prayer icons: enabled and disabled variants */
     Texture2D prayer_on[GUI_NUM_PRAYERS];
-    Texture2D prayer_off[GUI_NUM_PRAYERS];
 
-    /* spell icons: enabled and disabled variants */
     Texture2D spell_on[GUI_NUM_SPELLS];
     Texture2D spell_off[GUI_NUM_SPELLS];
 
-    /* special attack bar sprite */
-    Texture2D spec_bar;
-    int spec_bar_loaded;
+    Texture2D slot_tile;
 
-    /* interface chrome sprites */
-    Texture2D side_panel_bg;       /* 1031: stone background tile */
-    Texture2D tabs_row_bottom;     /* 1032: bottom tab row strip */
-    Texture2D tabs_row_top;        /* 1036: top tab row strip */
-    Texture2D tab_stone_sel[5];    /* 1026-1030: selected tab corners + middle */
-    Texture2D slanted_tab;         /* 952: inactive tab button */
-    Texture2D slanted_tab_hover;   /* 953: hovered tab button */
-    Texture2D slot_tile;           /* 170: equipment slot background */
-    Texture2D slot_selected;       /* 179: equipment slot selected */
-    Texture2D orb_frame;           /* 1071: minimap orb frame */
-    int chrome_loaded;
+    Texture2D minimap_compass;
+    Texture2D minimap_compass_masked;
+    Texture2D minimap_alpha_mask;
+    Texture2D minimap_frame;
+    Texture2D rm_minimap_alpha_mask;
+    Texture2D rm_minimap_frame;
+    Texture2D rm_compass_alpha_mask;
+    Texture2D rm_tabs_top_row;
+    Texture2D minimap_dot_player;
+    Texture2D minimap_dot_npc;
 
-    /* minimap chrome sprites (canonical OSRS sprite IDs from RuneLite SpriteID).
-       loaded once at init, then composited each frame in render_draw_minimap_area.
-       both fixed-mode (1182/1183/1184) and resizable-mode (1177/1178/1179)
-       variants are kept resident so the layout can be switched at runtime. */
-    Texture2D minimap_compass;       /* 169: compass disc, rotates with cam yaw */
-    Texture2D minimap_alpha_mask;    /* 1183: fixed-mode circular cutout */
-    Texture2D minimap_frame;         /* 1182: fixed-mode frame chrome */
-    Texture2D rm_minimap_alpha_mask; /* 1178: resizable-mode circular cutout */
-    Texture2D rm_minimap_frame;      /* 1177: resizable-mode frame chrome */
-    Texture2D rm_compass_alpha_mask; /* 1179: resizable-mode compass mask */
-    Texture2D rm_side_panel_bg;        /* 897: tiled side panel background */
-    Texture2D rm_side_panel_edge_left; /* 1175: 26x261 left vertical strip */
-    Texture2D rm_side_panel_edge_right;/* 1176: 26x261 right vertical strip */
-    Texture2D rm_tabs_top_row;         /* 1173: 241x37 top tab strip */
-    Texture2D rm_tabs_bottom_row;      /* 1174: 241x37 bottom tab strip */
-    Texture2D rm_tab_stone;            /* 1180: 33x36 inactive tab stone */
-    Texture2D rm_tab_stone_selected;   /* 1181: 33x36 active tab stone */
-    Texture2D orb_empty;             /* 1059: greyed orb disc (base chrome) */
-    Texture2D orb_hp;                /* 1060: green-fill HP orb */
-    Texture2D orb_prayer;            /* 1063: prayer orb chrome */
-    Texture2D orb_run;               /* 1064: run-energy orb chrome */
-    Texture2D orb_run_active;        /* 1065: run-energy orb when running */
-    Texture2D orb_icon_hp;           /* 1067: heart icon inside HP orb */
-    Texture2D orb_icon_prayer;       /* 1068: prayer icon */
-    Texture2D orb_icon_walk;         /* 1069: walking-foot icon */
-    Texture2D orb_icon_run;          /* 1070: running-foot icon */
-    Texture2D minimap_dot_player;    /* 512: white square for player */
-    Texture2D minimap_dot_npc;       /* 511: yellow square for NPCs */
-    Texture2D minimap_dot_friend;    /* 513: green square for friendlies */
-    Texture2D minimap_dot_item;      /* 510: red square for ground items */
-    int minimap_chrome_loaded;
-
-    /* skill icons for stats tab (25x25 from RuneLite skill_icons) */
-    #define GUI_NUM_SKILL_ICONS 7
-    Texture2D skill_icons[7];  /* attack, strength, defence, ranged, prayer, magic, hitpoints */
-    int skill_icons_loaded;
-
-    /* item sprites: keyed by OSRS item ID (from data/sprites/items/{id}.png) */
     #define GUI_MAX_ITEM_SPRITES 256
-    int item_sprite_ids[GUI_MAX_ITEM_SPRITES];     /* OSRS item ID, 0 = empty */
-    Texture2D item_sprite_tex[GUI_MAX_ITEM_SPRITES]; /* corresponding texture */
+    int item_sprite_ids[GUI_MAX_ITEM_SPRITES];
+    Texture2D item_sprite_tex[GUI_MAX_ITEM_SPRITES];
     int item_sprite_count;
 
-    /* inventory grid: 28 slots (4x7). initialized once at reset, then updated
-       incrementally — items stay in their assigned slots (no compaction on eat).
-       positions are user-rearrangeable via drag-and-drop. */
     InvSlot inv_grid[INV_GRID_SLOTS];
-    int inv_grid_dirty;   /* 1 = needs full rebuild from player state */
+    int inv_grid_dirty;
 
-    /* previous player state for incremental inventory updates.
-       compared each tick to detect gear switches and consumable use. */
+    int display_inventory_osrs_ids[INV_GRID_SLOTS];
+    int display_inventory_count;
+
     uint8_t inv_prev_equipped[NUM_GEAR_SLOTS];
     int inv_prev_food_count;
     int inv_prev_karambwan_count;
@@ -462,37 +355,80 @@ typedef struct {
     int inv_prev_antivenom_doses;
     int inv_prev_saturated_heart_count;
 
-    /* human-clicked inventory slot: when a human clicks a consumable, this records
-       the exact slot so gui_update_inventory removes from that slot instead of the
-       last one. -1 = no human click pending, use default last-slot removal. */
     int human_clicked_inv_slot;
 
-    /* click dim animation: slot index and countdown (50 Hz client ticks) */
-    int inv_dim_slot;     /* -1 = none */
-    int inv_dim_timer;    /* counts down from INV_DIM_TICKS */
+    int inv_dim_slot;
+    int inv_dim_timer;
 
-    /* drag state */
-    int inv_drag_active;       /* 1 = currently dragging */
-    int inv_drag_src_slot;     /* slot being dragged */
-    int inv_drag_start_x;     /* mouse position at drag start */
+    int inv_drag_active;
+    int inv_drag_src_slot;
+    int inv_drag_start_x;
     int inv_drag_start_y;
-    int inv_drag_mouse_x;     /* current mouse position during drag */
+    int inv_drag_mouse_x;
     int inv_drag_mouse_y;
+    double inv_drag_press_time;
 
-    /* spell targeting: GuiSpellIdx of the spell awaiting an enemy click, or
-       -1 when not targeting. render code sets this before calling gui_draw. */
     int pending_spell_highlight;
     int autocast_selector_open;
 } GuiState;
 
+static inline void gui_mouse_to_panel_space(
+    const GuiState* gs, int mx, int my, int* out_x, int* out_y
+) {
+    float k = gs->ui_scale > 0.0f ? gs->ui_scale : 1.0f;
+    float fx = (float)(gs->panel_x + gs->panel_w);
+    float fy = (float)(gs->panel_y + gs->panel_h);
+    *out_x = (int)lroundf(fx + ((float)mx - fx) / k);
+    *out_y = (int)lroundf(fy + ((float)my - fy) / k);
+}
 
-/** Try loading a texture, returns 1 on success. */
-static int gui_try_load(Texture2D* tex, const char* path) {
-    if (osrs_asset_exists(path)) {
-        *tex = osrs_asset_load_texture(path);
-        return 1;
+static inline void gui_mouse_to_minimap_space(
+    const GuiState* gs, int mx, int my, int* out_x, int* out_y
+) {
+    float k = gs->ui_scale > 0.0f ? gs->ui_scale : 1.0f;
+    float fx = (float)(gs->panel_x + gs->panel_w);
+    *out_x = (int)lroundf(fx + ((float)mx - fx) / k);
+    *out_y = (int)lroundf((float)my / k);
+}
+
+static Texture2D gui_require_texture(const char* path) {
+    Texture2D tex = osrs_asset_load_texture(path);
+    if (tex.id != 0) return tex;
+
+    fprintf(stderr, "GUI: failed to load required texture %s\n", path);
+    abort();
+}
+
+static Texture2D gui_require_masked_compass(const char* path) {
+    Image image = osrs_asset_load_image(path);
+    if (!image.data) {
+        fprintf(stderr, "GUI: failed to load required compass image %s\n", path);
+        abort();
     }
-    return 0;
+
+    ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    Color* pixels = (Color*)image.data;
+    int min_side = image.width < image.height ? image.width : image.height;
+    float cx = (float)image.width * 0.5f;
+    float cy = (float)image.height * 0.5f;
+    float radius = (float)min_side * (19.0f / 51.0f);
+    float radius_sq = radius * radius;
+    for (int y = 0; y < image.height; y++) {
+        for (int x = 0; x < image.width; x++) {
+            float dx = ((float)x + 0.5f) - cx;
+            float dy = ((float)y + 0.5f) - cy;
+            if (dx * dx + dy * dy > radius_sq) {
+                pixels[x + y * image.width].a = 0;
+            }
+        }
+    }
+
+    Texture2D tex = LoadTextureFromImage(image);
+    UnloadImage(image);
+    if (tex.id != 0) return tex;
+
+    fprintf(stderr, "GUI: failed to create required compass texture from %s\n", path);
+    abort();
 }
 
 static int gui_rect_has_area(Rectangle rect) {
@@ -508,17 +444,21 @@ static Rectangle gui_rect_intersect(Rectangle a, Rectangle b) {
     return (Rectangle){x1, y1, x2 - x1, y2 - y1};
 }
 
-static void gui_apply_scissor(Rectangle rect) {
-    int x = (int)(rect.x + 0.5f);
-    int y = (int)(rect.y + 0.5f);
-    int w = (int)(rect.width + 0.5f);
-    int h = (int)(rect.height + 0.5f);
+static void gui_apply_scissor(const GuiState* gs, Rectangle rect) {
+    float k = gs->ui_scale > 0.0f ? gs->ui_scale : 1.0f;
+    float fx = (float)(gs->panel_x + gs->panel_w);
+    float fy = (float)(gs->panel_y + gs->panel_h);
+    int x = (int)floorf(fx + (rect.x - fx) * k);
+    int y = (int)floorf(fy + (rect.y - fy) * k);
+    int w = (int)ceilf(rect.width * k);
+    int h = (int)ceilf(rect.height * k);
     if (w < 0) w = 0;
     if (h < 0) h = 0;
     BeginScissorMode(x, y, w, h);
 }
 
 static void gui_push_clip(
+    const GuiState* gs,
     GuiUiClipState* clip,
     Rectangle next,
     Rectangle* prev,
@@ -529,65 +469,100 @@ static void gui_push_clip(
     if (clip->active) next = gui_rect_intersect(next, clip->current);
     if (!gui_rect_has_area(next)) next = (Rectangle){0};
     if (clip->active) EndScissorMode();
-    gui_apply_scissor(next);
+    gui_apply_scissor(gs, next);
     clip->current = next;
     clip->active = 1;
 }
 
-static void gui_pop_clip(GuiUiClipState* clip, Rectangle prev, int prev_active) {
+static void gui_pop_clip(
+    const GuiState* gs, GuiUiClipState* clip, Rectangle prev, int prev_active
+) {
     if (clip->active) EndScissorMode();
     clip->current = prev;
     clip->active = prev_active;
-    if (clip->active) gui_apply_scissor(clip->current);
+    if (clip->active) gui_apply_scissor(gs, clip->current);
 }
 
 static Font gui_font_for_size(const GuiState* gs, int size) {
-    if (gs && size <= 12 && gs->small_font_loaded) return gs->small_font;
-    if (gs && gs->font_loaded) return gs->font;
-    return GetFontDefault();
+    return size <= 12 ? gs->small_font : gs->font;
 }
 
 static int gui_measure_text(const GuiState* gs, const char* text, int size) {
     if (!text || !text[0]) return 0;
     Font font = gui_font_for_size(gs, size);
-    if (font.texture.id == 0) return MeasureText(text, size);
     Vector2 measured = MeasureTextEx(font, text, (float)size, 0.0f);
     return (int)(measured.x + 0.5f);
 }
 
+static Font gui_require_font(const char* path, int size) {
+    Font font = osrs_asset_load_font(path, size);
+    if (font.texture.id != 0) return font;
+
+    fprintf(stderr, "GUI: failed to load required font %s\n", path);
+    abort();
+}
+
 static void gui_load_fonts(GuiState* gs) {
-    gs->font = osrs_asset_load_font("fonts/runescape.ttf", 14);
-    gs->font_loaded = gs->font.texture.id != 0;
-    if (gs->font_loaded) SetTextureFilter(gs->font.texture, TEXTURE_FILTER_POINT);
-    gs->small_font = osrs_asset_load_font("fonts/runescape_small.ttf", 12);
-    gs->small_font_loaded = gs->small_font.texture.id != 0;
-    if (gs->small_font_loaded) SetTextureFilter(gs->small_font.texture, TEXTURE_FILTER_POINT);
+    gs->font = gui_require_font(OSRS_ASSET("fonts/runescape.ttf"), 14);
+    SetTextureFilter(gs->font.texture, TEXTURE_FILTER_POINT);
+    gs->small_font = gui_require_font(OSRS_ASSET("fonts/runescape_small.ttf"), 12);
+    SetTextureFilter(gs->small_font.texture, TEXTURE_FILTER_POINT);
 }
 
 static void gui_load_item_stack_variants(GuiState* gs) {
+    const char* path = OSRS_ASSET("sprites/items/item_stack_variants.tsv");
     gs->item_stack_variant_count = 0;
-    FILE* f = osrs_asset_fopen("sprites/items/item_stack_variants.tsv", "rb");
-    if (!f) return;
+    FILE* f = osrs_asset_fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "GUI: failed to load required item stack table %s\n", path);
+        abort();
+    }
+
     char line[128];
+    int line_number = 0;
     while (fgets(line, sizeof(line), f)) {
+        line_number++;
+        if (!strchr(line, '\n') && !feof(f)) {
+            fprintf(stderr, "GUI: malformed item stack row at %s:%d\n", path, line_number);
+            abort();
+        }
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+
         GuiItemStackVariant variant = {0};
-        if (sscanf(line, "%d\t%d\t%d",
+        int consumed = 0;
+        if (sscanf(line, "%d\t%d\t%d%n",
                 &variant.base_item_id,
                 &variant.threshold,
-                &variant.display_item_id) != 3) {
-            continue;
+                &variant.display_item_id,
+                &consumed) != 3) {
+            fprintf(stderr, "GUI: malformed item stack row at %s:%d\n", path, line_number);
+            abort();
+        }
+        while (line[consumed] == ' ' || line[consumed] == '\t'
+                || line[consumed] == '\r' || line[consumed] == '\n') {
+            consumed++;
+        }
+        if (line[consumed] != '\0'
+                || variant.base_item_id <= 0
+                || variant.threshold <= 0
+                || variant.display_item_id <= 0) {
+            fprintf(stderr, "GUI: malformed item stack row at %s:%d\n", path, line_number);
+            abort();
         }
         if (gs->item_stack_variant_count >= GUI_ITEM_STACK_VARIANT_MAX) {
-            fprintf(stderr, "too many item stack variants\n");
+            fprintf(stderr, "GUI: too many item stack rows in %s\n", path);
             abort();
         }
         gs->item_stack_variants[gs->item_stack_variant_count++] = variant;
     }
+    if (ferror(f)) {
+        fprintf(stderr, "GUI: failed while reading required item stack table %s\n", path);
+        abort();
+    }
     fclose(f);
 }
 
-static Texture2D gui_asset(const GuiState* gs, const char* name) {
+static Texture2D gui_find_asset(const GuiState* gs, const char* name) {
     for (int i = 0; i < gs->named_asset_count; i++) {
         if (strcmp(gs->named_assets[i].name, name) == 0) {
             return gs->named_assets[i].tex;
@@ -596,15 +571,28 @@ static Texture2D gui_asset(const GuiState* gs, const char* name) {
     return (Texture2D){0};
 }
 
+static Texture2D gui_asset(const GuiState* gs, const char* name) {
+    Texture2D tex = gui_find_asset(gs, name);
+    if (tex.id != 0) return tex;
+
+    if (name[0] == '#') {
+        fprintf(stderr, "GUI: required sprite raw asset ID %s was not loaded\n", name + 1);
+    } else {
+        char logical_path[128];
+        snprintf(logical_path, sizeof(logical_path), "sprites/gui/%s.png", name);
+        fprintf(stderr, "GUI: required named sprite was not loaded at %s\n",
+            OSRS_ASSET(logical_path));
+    }
+    abort();
+}
+
 static Texture2D gui_load_named_asset_path(GuiState* gs, const char* name, const char* path) {
     if (gs->named_asset_count >= GUI_MAX_NAMED_ASSETS) {
-        fprintf(stderr, "GUI named asset capacity exceeded\n");
+        fprintf(stderr, "GUI: named asset capacity exceeded while loading %s\n", path);
         abort();
     }
 
-    Texture2D tex = {0};
-    if (!gui_try_load(&tex, path)) return tex;
-
+    Texture2D tex = gui_require_texture(path);
     GuiNamedAsset* asset = &gs->named_assets[gs->named_asset_count++];
     snprintf(asset->name, sizeof(asset->name), "%s", name);
     asset->tex = tex;
@@ -612,22 +600,25 @@ static Texture2D gui_load_named_asset_path(GuiState* gs, const char* name, const
 }
 
 static void gui_load_named_asset(GuiState* gs, const char* name) {
-    char path[160];
-    snprintf(path, sizeof(path), OSRS_ASSET("sprites/gui/%s.png"), name);
-    gui_load_named_asset_path(gs, name, path);
+    char logical_path[128];
+    snprintf(logical_path, sizeof(logical_path), "sprites/gui/%s.png", name);
+    gui_load_named_asset_path(gs, name, OSRS_ASSET(logical_path));
 }
 
 static Texture2D gui_sprite_asset(GuiState* gs, int sprite_id) {
-    if (sprite_id < 0) return (Texture2D){0};
+    if (sprite_id < 0) {
+        fprintf(stderr, "GUI: invalid required sprite raw asset ID %d\n", sprite_id);
+        abort();
+    }
 
     char name[32];
     snprintf(name, sizeof(name), "#%d", sprite_id);
-    Texture2D tex = gui_asset(gs, name);
+    Texture2D tex = gui_find_asset(gs, name);
     if (tex.id != 0) return tex;
 
-    char path[160];
-    snprintf(path, sizeof(path), OSRS_ASSET("sprites/gui/%d.png"), sprite_id);
-    return gui_load_named_asset_path(gs, name, path);
+    char logical_path[64];
+    snprintf(logical_path, sizeof(logical_path), "sprites/gui/%d.png", sprite_id);
+    return gui_load_named_asset_path(gs, name, OSRS_ASSET(logical_path));
 }
 
 static void gui_load_named_asset_range(GuiState* gs, const char* prefix, int first, int last) {
@@ -638,9 +629,6 @@ static void gui_load_named_asset_range(GuiState* gs, const char* prefix, int fir
     }
 }
 
-static int gui_load_ui_interfaces(GuiState* gs) {
-    return osrs_ui_interfaces_load(&gs->ui_interfaces, OSRS_ASSET("ui/interfaces.bin"));
-}
 
 static const int GUI_PRAYER_ON_SPRITE_IDS[GUI_NUM_PRAYERS] = {
     115, 116, 117, 133, 134,
@@ -651,15 +639,6 @@ static const int GUI_PRAYER_ON_SPRITE_IDS[GUI_NUM_PRAYERS] = {
     945, 946, 1420, 1421,
 };
 
-static const int GUI_PRAYER_OFF_SPRITE_IDS[GUI_NUM_PRAYERS] = {
-    135, 136, 137, 153, 154,
-    138, 139, 140, 141, 142,
-    143, 506, 507, 144, 145,
-    146, 147, 148, 149, 508,
-    509, 151, 150, 152, 951,
-    949, 950, 1424, 1425,
-};
-
 static const int GUI_SPELL_ON_SPRITE_IDS[GUI_NUM_SPELLS] = {
     329, 337, 333, 325,
     330, 338, 334, 326,
@@ -667,7 +646,6 @@ static const int GUI_SPELL_ON_SPRITE_IDS[GUI_NUM_SPELLS] = {
     332, 340, 336, 328,
     341, 342, 343, 344,
     345, 346, 347, 348,
-    564,
 };
 
 static const int GUI_SPELL_OFF_SPRITE_IDS[GUI_NUM_SPELLS] = {
@@ -677,17 +655,11 @@ static const int GUI_SPELL_OFF_SPRITE_IDS[GUI_NUM_SPELLS] = {
     382, 390, 386, 378,
     391, 392, 393, 394,
     395, 396, 397, 398,
-    614,
 };
 
 static int gui_prayer_on_sprite_id(GuiPrayerIdx idx) {
     assert(idx >= 0 && idx < GUI_NUM_PRAYERS);
     return GUI_PRAYER_ON_SPRITE_IDS[idx];
-}
-
-static int gui_prayer_off_sprite_id(GuiPrayerIdx idx) {
-    assert(idx >= 0 && idx < GUI_NUM_PRAYERS);
-    return GUI_PRAYER_OFF_SPRITE_IDS[idx];
 }
 
 static int gui_spell_on_sprite_id(GuiSpellIdx idx) {
@@ -700,162 +672,112 @@ static int gui_spell_off_sprite_id(GuiSpellIdx idx) {
     return GUI_SPELL_OFF_SPRITE_IDS[idx];
 }
 
-/** Load all GUI sprites from data/sprites/gui/. */
+static int gui_find_sprite_index_by_osrs_id(const GuiState* gs, int osrs_id) {
+    if (osrs_id <= 0) return -1;
+    for (int i = 0; i < gs->item_sprite_count; i++) {
+        if (gs->item_sprite_ids[i] == osrs_id) return i;
+    }
+    return -1;
+}
+
+static Texture2D gui_load_required_sprite_by_osrs_id(GuiState* gs, int osrs_id) {
+    if (osrs_id <= 0) {
+        fprintf(stderr, "GUI: invalid required item sprite raw asset ID %d\n", osrs_id);
+        abort();
+    }
+
+    int existing_idx = gui_find_sprite_index_by_osrs_id(gs, osrs_id);
+    if (existing_idx >= 0) return gs->item_sprite_tex[existing_idx];
+
+    char logical_path[64];
+    snprintf(logical_path, sizeof(logical_path), "sprites/items/%d.png", osrs_id);
+    const char* path = OSRS_ASSET(logical_path);
+    if (gs->item_sprite_count >= GUI_MAX_ITEM_SPRITES) {
+        fprintf(stderr,
+            "GUI: item sprite capacity exceeded while loading raw asset ID %d at %s\n",
+            osrs_id, path);
+        abort();
+    }
+
+    Texture2D tex = gui_require_texture(path);
+    int idx = gs->item_sprite_count++;
+    gs->item_sprite_ids[idx] = osrs_id;
+    gs->item_sprite_tex[idx] = tex;
+    return tex;
+}
+
+static void gui_require_sprite_by_osrs_id(GuiState* gs, int osrs_id) {
+    (void)gui_load_required_sprite_by_osrs_id(gs, osrs_id);
+}
+
 static void gui_load_sprites(GuiState* gs) {
-    gs->sprites_loaded = 1;
-    int ok = 1;
     gs->named_asset_count = 0;
-    gui_load_ui_interfaces(gs);
+    const char* interfaces_path = OSRS_ASSET("ui/interfaces.bin");
+    if (!osrs_ui_interfaces_load(&gs->ui_interfaces, interfaces_path)) {
+        fprintf(stderr, "GUI: failed to load required interfaces at %s\n", interfaces_path);
+        abort();
+    }
     gui_load_fonts(gs);
     gui_load_item_stack_variants(gs);
 
-    /* equipment slot backgrounds: sprite IDs mapped to GEAR_SLOT_* order.
-       GEAR_SLOT: HEAD=0, CAPE=1, NECK=2, AMMO=3, WEAPON=4, SHIELD=5,
-                  BODY=6, LEGS=7, HANDS=8, FEET=9, RING=10 */
     const char* slot_files[] = {
-        OSRS_ASSET("sprites/gui/slot_head.png"),    /* GEAR_SLOT_HEAD */
-        OSRS_ASSET("sprites/gui/slot_cape.png"),    /* GEAR_SLOT_CAPE */
-        OSRS_ASSET("sprites/gui/slot_neck.png"),    /* GEAR_SLOT_NECK */
-        OSRS_ASSET("sprites/gui/slot_tile.png"),    /* GEAR_SLOT_AMMO (use tile bg) */
-        OSRS_ASSET("sprites/gui/slot_weapon.png"),  /* GEAR_SLOT_WEAPON */
-        OSRS_ASSET("sprites/gui/slot_shield.png"),  /* GEAR_SLOT_SHIELD */
-        OSRS_ASSET("sprites/gui/slot_body.png"),    /* GEAR_SLOT_BODY */
-        OSRS_ASSET("sprites/gui/slot_legs.png"),    /* GEAR_SLOT_LEGS */
-        OSRS_ASSET("sprites/gui/slot_hands.png"),   /* GEAR_SLOT_HANDS */
-        OSRS_ASSET("sprites/gui/slot_feet.png"),    /* GEAR_SLOT_FEET */
-        OSRS_ASSET("sprites/gui/slot_ring.png"),    /* GEAR_SLOT_RING */
-        OSRS_ASSET("sprites/gui/slot_tile.png"),    /* spare tile bg */
+        OSRS_ASSET("sprites/gui/slot_head.png"),
+        OSRS_ASSET("sprites/gui/slot_cape.png"),
+        OSRS_ASSET("sprites/gui/slot_neck.png"),
+        OSRS_ASSET("sprites/gui/slot_tile.png"),
+        OSRS_ASSET("sprites/gui/slot_weapon.png"),
+        OSRS_ASSET("sprites/gui/slot_shield.png"),
+        OSRS_ASSET("sprites/gui/slot_body.png"),
+        OSRS_ASSET("sprites/gui/slot_legs.png"),
+        OSRS_ASSET("sprites/gui/slot_hands.png"),
+        OSRS_ASSET("sprites/gui/slot_feet.png"),
+        OSRS_ASSET("sprites/gui/slot_ring.png"),
+        OSRS_ASSET("sprites/gui/slot_tile.png"),
     };
     for (int i = 0; i < GUI_NUM_SLOT_SPRITES; i++) {
-        ok &= gui_try_load(&gs->slot_sprites[i], slot_files[i]);
-    }
-    gui_try_load(&gs->slot_tile_bg, OSRS_ASSET("sprites/gui/slot_tile.png"));
-
-    /* tab icons: mapped to GuiTab enum order (7 tabs) */
-    const char* tab_files[] = {
-        OSRS_ASSET("sprites/gui/tab_combat.png"),    /* GUI_TAB_COMBAT */
-        OSRS_ASSET("sprites/gui/tab_stats.png"),     /* GUI_TAB_STATS */
-        OSRS_ASSET("sprites/gui/tab_quests.png"),    /* GUI_TAB_QUESTS */
-        OSRS_ASSET("sprites/gui/tab_inventory.png"), /* GUI_TAB_INVENTORY */
-        OSRS_ASSET("sprites/gui/tab_equipment.png"), /* GUI_TAB_EQUIPMENT */
-        OSRS_ASSET("sprites/gui/tab_prayer.png"),    /* GUI_TAB_PRAYER */
-        OSRS_ASSET("sprites/gui/tab_magic.png"),     /* GUI_TAB_SPELLBOOK */
-    };
-    for (int i = 0; i < GUI_TAB_COUNT; i++) {
-        ok &= gui_try_load(&gs->tab_icons[i], tab_files[i]);
-    }
-
-    /* skill icons for stats tab (OSRS skill_icons from RuneLite resources) */
-    const char* skill_icon_files[] = {
-        OSRS_ASSET("sprites/gui/skill_attack.png"),
-        OSRS_ASSET("sprites/gui/skill_strength.png"),
-        OSRS_ASSET("sprites/gui/skill_defence.png"),
-        OSRS_ASSET("sprites/gui/skill_ranged.png"),
-        OSRS_ASSET("sprites/gui/skill_prayer.png"),
-        OSRS_ASSET("sprites/gui/skill_magic.png"),
-        OSRS_ASSET("sprites/gui/skill_hitpoints.png"),
-    };
-    gs->skill_icons_loaded = 1;
-    for (int i = 0; i < 7; i++) {
-        gs->skill_icons_loaded &= gui_try_load(&gs->skill_icons[i], skill_icon_files[i]);
+        gs->slot_sprites[i] = gui_require_texture(slot_files[i]);
     }
 
     for (int i = 0; i < GUI_NUM_PRAYERS; i++) {
-        const char* on_path = TextFormat(OSRS_ASSET("sprites/gui/%d.png"),
+        char logical_path[64];
+        snprintf(logical_path, sizeof(logical_path), "sprites/gui/%d.png",
             gui_prayer_on_sprite_id((GuiPrayerIdx)i));
-        const char* off_path = TextFormat(OSRS_ASSET("sprites/gui/%d.png"),
-            gui_prayer_off_sprite_id((GuiPrayerIdx)i));
-        gui_try_load(&gs->prayer_on[i], on_path);
-        gui_try_load(&gs->prayer_off[i], off_path);
+        gs->prayer_on[i] = gui_require_texture(OSRS_ASSET(logical_path));
     }
 
     for (int i = 0; i < GUI_NUM_SPELLS; i++) {
-        const char* on_path = TextFormat(OSRS_ASSET("sprites/gui/%d.png"),
+        char on_logical_path[64];
+        char off_logical_path[64];
+        snprintf(on_logical_path, sizeof(on_logical_path), "sprites/gui/%d.png",
             gui_spell_on_sprite_id((GuiSpellIdx)i));
-        const char* off_path = TextFormat(OSRS_ASSET("sprites/gui/%d.png"),
+        snprintf(off_logical_path, sizeof(off_logical_path), "sprites/gui/%d.png",
             gui_spell_off_sprite_id((GuiSpellIdx)i));
-        gui_try_load(&gs->spell_on[i], on_path);
-        gui_try_load(&gs->spell_off[i], off_path);
+        gs->spell_on[i] = gui_require_texture(OSRS_ASSET(on_logical_path));
+        gs->spell_off[i] = gui_require_texture(OSRS_ASSET(off_logical_path));
     }
 
-    /* special attack bar */
-    gs->spec_bar_loaded = gui_try_load(&gs->spec_bar, OSRS_ASSET("sprites/gui/special_attack.png"));
+    gs->slot_tile = gui_require_texture(OSRS_ASSET("sprites/gui/slot_tile.png"));
 
-    /* interface chrome */
-    gs->chrome_loaded = 1;
-    gs->chrome_loaded &= gui_try_load(&gs->side_panel_bg, OSRS_ASSET("sprites/gui/side_panel_bg.png"));
-    gs->chrome_loaded &= gui_try_load(&gs->tabs_row_bottom, OSRS_ASSET("sprites/gui/tabs_row_bottom.png"));
-    gs->chrome_loaded &= gui_try_load(&gs->tabs_row_top, OSRS_ASSET("sprites/gui/tabs_row_top.png"));
-    gui_try_load(&gs->slanted_tab, OSRS_ASSET("sprites/gui/slanted_tab.png"));
-    gui_try_load(&gs->slanted_tab_hover, OSRS_ASSET("sprites/gui/slanted_tab_hover.png"));
-    gui_try_load(&gs->slot_tile, OSRS_ASSET("sprites/gui/slot_tile.png"));
-    gui_try_load(&gs->slot_selected, OSRS_ASSET("sprites/gui/slot_selected.png"));
-    gui_try_load(&gs->orb_frame, OSRS_ASSET("sprites/gui/orb_frame.png"));
-
-    /* canonical OSRS minimap chrome (loaded best-effort; gracefully omitted if
-       the asset bundle predates the export pipeline update). */
-    gs->minimap_chrome_loaded = 1;
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_compass,
-        OSRS_ASSET("sprites/gui/compass.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_alpha_mask,
-        OSRS_ASSET("sprites/gui/minimap_alpha_mask.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_frame,
-        OSRS_ASSET("sprites/gui/minimap_and_compass_frame.png"));
-    gui_try_load(&gs->rm_minimap_alpha_mask,
-        OSRS_ASSET("sprites/gui/rm_minimap_alpha_mask.png"));
-    gui_try_load(&gs->rm_minimap_frame,
-        OSRS_ASSET("sprites/gui/rm_minimap_and_compass_frame.png"));
-    gui_try_load(&gs->rm_compass_alpha_mask,
-        OSRS_ASSET("sprites/gui/rm_compass_alpha_mask.png"));
-    gui_try_load(&gs->rm_side_panel_bg,
-        OSRS_ASSET("sprites/gui/rm_side_panel_bg.png"));
-    gui_try_load(&gs->rm_side_panel_edge_left,
-        OSRS_ASSET("sprites/gui/rm_side_panel_edge_left.png"));
-    gui_try_load(&gs->rm_side_panel_edge_right,
-        OSRS_ASSET("sprites/gui/rm_side_panel_edge_right.png"));
-    gui_try_load(&gs->rm_tabs_top_row,
-        OSRS_ASSET("sprites/gui/rm_tabs_top_row.png"));
-    gui_try_load(&gs->rm_tabs_bottom_row,
-        OSRS_ASSET("sprites/gui/rm_tabs_bottom_row.png"));
-    gui_try_load(&gs->rm_tab_stone,
-        OSRS_ASSET("sprites/gui/rm_tab_stone_middle.png"));
-    gui_try_load(&gs->rm_tab_stone_selected,
-        OSRS_ASSET("sprites/gui/rm_tab_stone_middle_selected.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_empty,
-        OSRS_ASSET("sprites/gui/orb_empty.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_hp,
-        OSRS_ASSET("sprites/gui/orb_hp.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_prayer,
-        OSRS_ASSET("sprites/gui/orb_prayer.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_run,
-        OSRS_ASSET("sprites/gui/orb_run.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_run_active,
-        OSRS_ASSET("sprites/gui/orb_run_active.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_icon_hp,
-        OSRS_ASSET("sprites/gui/orb_icon_hp.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_icon_prayer,
-        OSRS_ASSET("sprites/gui/orb_icon_prayer.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_icon_walk,
-        OSRS_ASSET("sprites/gui/orb_icon_walk.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->orb_icon_run,
-        OSRS_ASSET("sprites/gui/orb_icon_run.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_dot_player,
-        OSRS_ASSET("sprites/gui/minimap_dot_player.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_dot_npc,
-        OSRS_ASSET("sprites/gui/minimap_dot_npc.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_dot_friend,
-        OSRS_ASSET("sprites/gui/minimap_dot_friend.png"));
-    gs->minimap_chrome_loaded &= gui_try_load(&gs->minimap_dot_item,
-        OSRS_ASSET("sprites/gui/minimap_dot_item.png"));
-
-    const char* tab_sel_files[] = {
-        OSRS_ASSET("sprites/gui/tab_stone_tl_sel.png"),
-        OSRS_ASSET("sprites/gui/tab_stone_tr_sel.png"),
-        OSRS_ASSET("sprites/gui/tab_stone_bl_sel.png"),
-        OSRS_ASSET("sprites/gui/tab_stone_br_sel.png"),
-        OSRS_ASSET("sprites/gui/tab_stone_mid_sel.png"),
-    };
-    for (int i = 0; i < 5; i++) gui_try_load(&gs->tab_stone_sel[i], tab_sel_files[i]);
+    gs->minimap_compass =
+        gui_require_texture(OSRS_ASSET("sprites/gui/compass.png"));
+    gs->minimap_compass_masked =
+        gui_require_masked_compass(OSRS_ASSET("sprites/gui/compass.png"));
+    gs->minimap_alpha_mask =
+        gui_require_texture(OSRS_ASSET("sprites/gui/minimap_alpha_mask.png"));
+    gs->minimap_frame =
+        gui_require_texture(OSRS_ASSET("sprites/gui/minimap_and_compass_frame.png"));
+    gs->rm_minimap_alpha_mask =
+        gui_require_texture(OSRS_ASSET("sprites/gui/rm_minimap_alpha_mask.png"));
+    gs->rm_minimap_frame =
+        gui_require_texture(OSRS_ASSET("sprites/gui/rm_minimap_and_compass_frame.png"));
+    gs->rm_compass_alpha_mask =
+        gui_require_texture(OSRS_ASSET("sprites/gui/rm_compass_alpha_mask.png"));
+    gs->rm_tabs_top_row =
+        gui_require_texture(OSRS_ASSET("sprites/gui/rm_tabs_top_row.png"));
+    gs->minimap_dot_player =
+        gui_require_texture(OSRS_ASSET("sprites/gui/minimap_dot_player.png"));
+    gs->minimap_dot_npc =
+        gui_require_texture(OSRS_ASSET("sprites/gui/minimap_dot_npc.png"));
 
     static const char* ui_asset_names[] = {
         "tradebacking_dark",
@@ -864,12 +786,9 @@ static void gui_load_sprites(GuiState* gs) {
         "osrs_stretch_side_columns_0",
         "osrs_stretch_side_columns_1",
         "osrs_stretch_mapsurround",
-        "compass",
         "compass_outline",
         "resize_map_mask",
-        "resize_compass_mask",
         "tli_button01_orb01_34x34_0",
-        "ring_34_0",
         "orb_xp_0",
         "ring_30",
         "worldmap_icon_0",
@@ -884,6 +803,8 @@ static void gui_load_sprites(GuiState* gs) {
         "options_icons_18",
         "options_icons_28",
         "whistle",
+        "prayerglow_0",
+        "prayerglow_1",
     };
     int ui_asset_count = (int)(sizeof(ui_asset_names) / sizeof(ui_asset_names[0]));
     for (int i = 0; i < ui_asset_count; i++) {
@@ -900,11 +821,6 @@ static void gui_load_sprites(GuiState* gs) {
     gui_load_named_asset_range(gs, "orb_icon", 0, 15);
     gui_load_named_asset_range(gs, "wornicons", 0, 11);
     gui_load_named_asset_range(gs, "skill_icon", 0, 23);
-    gui_load_named_asset_range(gs, "prayeron", 0, 28);
-    gui_load_named_asset_range(gs, "prayeroff", 0, 28);
-    gui_load_named_asset_range(gs, "magicon", 0, 47);
-    gui_load_named_asset_range(gs, "magicoff", 0, 47);
-    gui_load_named_asset_range(gs, "standard_spell_on", 0, 79);
 
     static const char* side_icon_names[] = {
         "side_icon_combat",
@@ -928,52 +844,9 @@ static void gui_load_sprites(GuiState* gs) {
         gui_load_named_asset(gs, side_icon_names[i]);
     }
 
-    if (!ok) {
-        TraceLog(LOG_WARNING, "GUI: some sprites missing from data/sprites/gui/");
-    }
-
-    /* load item sprites from data/sprites/items/{item_id}.png */
     gs->item_sprite_count = 0;
-    for (int i = 0; i < NUM_ITEMS && gs->item_sprite_count < GUI_MAX_ITEM_SPRITES; i++) {
-        int item_id = ITEM_DATABASE[i].item_id;
-        if (item_id <= 0) continue;
-        const char* path = TextFormat(OSRS_ASSET("sprites/items/%d.png"), item_id);
-        if (osrs_asset_exists(path)) {
-            int idx = gs->item_sprite_count;
-            gs->item_sprite_ids[idx] = item_id;
-            gs->item_sprite_tex[idx] = osrs_asset_load_texture(path);
-            gs->item_sprite_count++;
-        }
-    }
-
-    /* consumable sprites: not in ITEM_DATABASE, load by OSRS item ID directly */
-    static const int consumable_ids[] = {
-        OSRS_ID_SHARK, OSRS_ID_KARAMBWAN,
-        OSRS_ID_BREW_4, OSRS_ID_BREW_3, OSRS_ID_BREW_2, OSRS_ID_BREW_1,
-        OSRS_ID_RESTORE_4, OSRS_ID_RESTORE_3, OSRS_ID_RESTORE_2, OSRS_ID_RESTORE_1,
-        OSRS_ID_COMBAT_4, OSRS_ID_COMBAT_3, OSRS_ID_COMBAT_2, OSRS_ID_COMBAT_1,
-        OSRS_ID_RANGED_4, OSRS_ID_RANGED_3, OSRS_ID_RANGED_2, OSRS_ID_RANGED_1,
-        OSRS_ID_ANTIVENOM_4, OSRS_ID_ANTIVENOM_3, OSRS_ID_ANTIVENOM_2, OSRS_ID_ANTIVENOM_1,
-        OSRS_ID_PRAYER_POT_4, OSRS_ID_PRAYER_POT_3, OSRS_ID_PRAYER_POT_2, OSRS_ID_PRAYER_POT_1,
-        OSRS_ID_BASTION_4, OSRS_ID_BASTION_3, OSRS_ID_BASTION_2, OSRS_ID_BASTION_1,
-        OSRS_ID_STAMINA_4, OSRS_ID_STAMINA_3, OSRS_ID_STAMINA_2, OSRS_ID_STAMINA_1,
-        OSRS_ID_SATURATED_HEART,
-    };
-    for (int i = 0; i < (int)(sizeof(consumable_ids)/sizeof(consumable_ids[0])); i++) {
-        if (gs->item_sprite_count >= GUI_MAX_ITEM_SPRITES) break;
-        int cid = consumable_ids[i];
-        const char* path = TextFormat(OSRS_ASSET("sprites/items/%d.png"), cid);
-        if (osrs_asset_exists(path)) {
-            int idx = gs->item_sprite_count;
-            gs->item_sprite_ids[idx] = cid;
-            gs->item_sprite_tex[idx] = osrs_asset_load_texture(path);
-            gs->item_sprite_count++;
-        }
-    }
-    TraceLog(LOG_INFO, "GUI: loaded %d item sprites (incl consumables)", gs->item_sprite_count);
 }
 
-/** Look up item sprite texture by item database index. Returns NULL texture (id=0) if not found. */
 static Texture2D gui_get_sprite_by_osrs_id(GuiState* gs, int osrs_id);
 
 static Texture2D gui_get_item_sprite(GuiState* gs, uint8_t item_idx) {
@@ -983,25 +856,12 @@ static Texture2D gui_get_item_sprite(GuiState* gs, uint8_t item_idx) {
     return gui_get_sprite_by_osrs_id(gs, item_id);
 }
 
-/** Look up item sprite texture by OSRS item ID directly (for consumables). */
 static Texture2D gui_get_sprite_by_osrs_id(GuiState* gs, int osrs_id) {
-    Texture2D empty = { 0 };
-    if (osrs_id <= 0) return empty;
-    for (int i = 0; i < gs->item_sprite_count; i++) {
-        if (gs->item_sprite_ids[i] == osrs_id) return gs->item_sprite_tex[i];
+    if (osrs_id <= 0) {
+        fprintf(stderr, "GUI: invalid required item sprite raw asset ID %d\n", osrs_id);
+        abort();
     }
-    if (gs->item_sprite_count >= GUI_MAX_ITEM_SPRITES) return empty;
-    const char* path = TextFormat(OSRS_ASSET("sprites/items/%d.png"), osrs_id);
-    if (!osrs_asset_exists(path)) return empty;
-    int idx = gs->item_sprite_count++;
-    gs->item_sprite_ids[idx] = osrs_id;
-    gs->item_sprite_tex[idx] = osrs_asset_load_texture(path);
-    if (gs->item_sprite_tex[idx].id == 0) {
-        gs->item_sprite_count--;
-        gs->item_sprite_ids[idx] = 0;
-        return empty;
-    }
-    return gs->item_sprite_tex[idx];
+    return gui_load_required_sprite_by_osrs_id(gs, osrs_id);
 }
 
 static int gui_coin_stack_display_id(int quantity) {
@@ -1037,15 +897,10 @@ static Texture2D gui_get_item_sprite_for_quantity(
     uint8_t item_idx,
     int quantity
 ) {
-    Texture2D empty = {0};
-    if (item_idx == ITEM_NONE || item_idx >= NUM_ITEMS) return empty;
+    if (item_idx == ITEM_NONE || item_idx >= NUM_ITEMS) return (Texture2D){0};
     int item_id = ITEM_DATABASE[item_idx].item_id;
     int display_id = gui_item_display_id_for_quantity(gs, item_id, quantity);
-    Texture2D tex = gui_get_sprite_by_osrs_id(gs, display_id);
-    if (tex.id == 0 && display_id != item_id) {
-        tex = gui_get_sprite_by_osrs_id(gs, item_id);
-    }
-    return tex;
+    return gui_get_sprite_by_osrs_id(gs, display_id);
 }
 
 static Texture2D gui_get_sprite_by_osrs_id_for_quantity(
@@ -1054,11 +909,7 @@ static Texture2D gui_get_sprite_by_osrs_id_for_quantity(
     int quantity
 ) {
     int display_id = gui_item_display_id_for_quantity(gs, osrs_id, quantity);
-    Texture2D tex = gui_get_sprite_by_osrs_id(gs, display_id);
-    if (tex.id == 0 && display_id != osrs_id) {
-        tex = gui_get_sprite_by_osrs_id(gs, osrs_id);
-    }
-    return tex;
+    return gui_get_sprite_by_osrs_id(gs, display_id);
 }
 
 static Color gui_stack_text_color(int quantity) {
@@ -1078,73 +929,37 @@ static void gui_format_stack_quantity(int quantity, char* dst, size_t cap) {
     }
 }
 
-/** Unload all GUI textures. */
 static void gui_unload_sprites(GuiState* gs) {
     osrs_ui_interfaces_unload(&gs->ui_interfaces);
-    if (!gs->sprites_loaded) return;
     for (int i = 0; i < gs->named_asset_count; i++) {
-        if (gs->named_assets[i].tex.id) UnloadTexture(gs->named_assets[i].tex);
+        UnloadTexture(gs->named_assets[i].tex);
     }
     gs->named_asset_count = 0;
     for (int i = 0; i < GUI_NUM_SLOT_SPRITES; i++) UnloadTexture(gs->slot_sprites[i]);
-    UnloadTexture(gs->slot_tile_bg);
-    for (int i = 0; i < GUI_TAB_COUNT; i++) UnloadTexture(gs->tab_icons[i]);
     for (int i = 0; i < GUI_NUM_PRAYERS; i++) {
         UnloadTexture(gs->prayer_on[i]);
-        UnloadTexture(gs->prayer_off[i]);
     }
     for (int i = 0; i < GUI_NUM_SPELLS; i++) {
         UnloadTexture(gs->spell_on[i]);
         UnloadTexture(gs->spell_off[i]);
     }
-    if (gs->spec_bar_loaded) UnloadTexture(gs->spec_bar);
-    if (gs->chrome_loaded) {
-        UnloadTexture(gs->side_panel_bg);
-        UnloadTexture(gs->tabs_row_bottom);
-        UnloadTexture(gs->tabs_row_top);
-        for (int i = 0; i < 5; i++) UnloadTexture(gs->tab_stone_sel[i]);
-    }
-    if (gs->slanted_tab.id) UnloadTexture(gs->slanted_tab);
-    if (gs->slanted_tab_hover.id) UnloadTexture(gs->slanted_tab_hover);
-    if (gs->slot_tile.id) UnloadTexture(gs->slot_tile);
-    if (gs->slot_selected.id) UnloadTexture(gs->slot_selected);
-    if (gs->orb_frame.id) UnloadTexture(gs->orb_frame);
-    if (gs->minimap_compass.id) UnloadTexture(gs->minimap_compass);
-    if (gs->minimap_alpha_mask.id) UnloadTexture(gs->minimap_alpha_mask);
-    if (gs->minimap_frame.id) UnloadTexture(gs->minimap_frame);
-    if (gs->rm_minimap_alpha_mask.id) UnloadTexture(gs->rm_minimap_alpha_mask);
-    if (gs->rm_minimap_frame.id) UnloadTexture(gs->rm_minimap_frame);
-    if (gs->rm_compass_alpha_mask.id) UnloadTexture(gs->rm_compass_alpha_mask);
-    if (gs->rm_side_panel_bg.id) UnloadTexture(gs->rm_side_panel_bg);
-    if (gs->rm_side_panel_edge_left.id) UnloadTexture(gs->rm_side_panel_edge_left);
-    if (gs->rm_side_panel_edge_right.id) UnloadTexture(gs->rm_side_panel_edge_right);
-    if (gs->rm_tabs_top_row.id) UnloadTexture(gs->rm_tabs_top_row);
-    if (gs->rm_tabs_bottom_row.id) UnloadTexture(gs->rm_tabs_bottom_row);
-    if (gs->rm_tab_stone.id) UnloadTexture(gs->rm_tab_stone);
-    if (gs->rm_tab_stone_selected.id) UnloadTexture(gs->rm_tab_stone_selected);
-    if (gs->orb_empty.id) UnloadTexture(gs->orb_empty);
-    if (gs->orb_hp.id) UnloadTexture(gs->orb_hp);
-    if (gs->orb_prayer.id) UnloadTexture(gs->orb_prayer);
-    if (gs->orb_run.id) UnloadTexture(gs->orb_run);
-    if (gs->orb_run_active.id) UnloadTexture(gs->orb_run_active);
-    if (gs->orb_icon_hp.id) UnloadTexture(gs->orb_icon_hp);
-    if (gs->orb_icon_prayer.id) UnloadTexture(gs->orb_icon_prayer);
-    if (gs->orb_icon_walk.id) UnloadTexture(gs->orb_icon_walk);
-    if (gs->orb_icon_run.id) UnloadTexture(gs->orb_icon_run);
-    if (gs->minimap_dot_player.id) UnloadTexture(gs->minimap_dot_player);
-    if (gs->minimap_dot_npc.id) UnloadTexture(gs->minimap_dot_npc);
-    if (gs->minimap_dot_friend.id) UnloadTexture(gs->minimap_dot_friend);
-    if (gs->minimap_dot_item.id) UnloadTexture(gs->minimap_dot_item);
+    UnloadTexture(gs->slot_tile);
+    UnloadTexture(gs->minimap_compass);
+    UnloadTexture(gs->minimap_compass_masked);
+    UnloadTexture(gs->minimap_alpha_mask);
+    UnloadTexture(gs->minimap_frame);
+    UnloadTexture(gs->rm_minimap_alpha_mask);
+    UnloadTexture(gs->rm_minimap_frame);
+    UnloadTexture(gs->rm_compass_alpha_mask);
+    UnloadTexture(gs->rm_tabs_top_row);
+    UnloadTexture(gs->minimap_dot_player);
+    UnloadTexture(gs->minimap_dot_npc);
     for (int i = 0; i < gs->item_sprite_count; i++) UnloadTexture(gs->item_sprite_tex[i]);
-    if (gs->font_loaded) UnloadFont(gs->font);
-    if (gs->small_font_loaded) UnloadFont(gs->small_font);
+    UnloadFont(gs->font);
+    UnloadFont(gs->small_font);
     gs->item_sprite_count = 0;
-    gs->font_loaded = 0;
-    gs->small_font_loaded = 0;
     gs->item_stack_variant_count = 0;
-    gs->sprites_loaded = 0;
 }
-
 
 static const char* gui_item_short_name(uint8_t item_idx) {
     if (item_idx == ITEM_NONE || item_idx >= NUM_ITEMS) return "";
@@ -1257,8 +1072,6 @@ static const char* gui_item_short_name(uint8_t item_idx) {
     }
 }
 
-
-/** Draw text with OSRS-style shadow (black at +1,+1, then color). */
 static void gui_text_shadow(
     const GuiState* gs,
     const char* text,
@@ -1275,18 +1088,8 @@ static void gui_text_shadow(
     DrawTextEx(font, text, pos, (float)size, 0.0f, color);
 }
 
-/** Draw an OSRS-style beveled slot rectangle. */
-static void gui_draw_slot(int x, int y, int w, int h, Color fill) {
-    DrawRectangle(x, y, w, h, fill);
-    DrawRectangleLines(x, y, w, h, GUI_BORDER);
-    DrawLine(x + 1, y + 1, x + w - 2, y + 1, GUI_BORDER_LT);
-    DrawLine(x + 1, y + 1, x + 1, y + h - 2, GUI_BORDER_LT);
-}
 
-/** Draw texture centered within a box, scaled to fit. */
 static void gui_draw_tex_centered(Texture2D tex, int bx, int by, int bw, int bh) {
-    if (tex.id == 0) return;
-    /* scale to fit while maintaining aspect ratio */
     float sx = (float)(bw - 4) / (float)tex.width;
     float sy = (float)(bh - 4) / (float)tex.height;
     float s = (sx < sy) ? sx : sy;
@@ -1297,35 +1100,20 @@ static void gui_draw_tex_centered(Texture2D tex, int bx, int by, int bw, int bh)
     DrawTextureEx(tex, (Vector2){ (float)dx, (float)dy }, 0.0f, s, WHITE);
 }
 
-/** Draw an equipment slot using real OSRS slot tile sprite + item/silhouette sprite. */
 static void gui_draw_equip_slot(GuiState* gs, int x, int y, int w, int h,
                                 int gear_slot, uint8_t item_idx) {
-    /* draw slot_tile (real OSRS 36x36 stone square) as background */
-    if (gs->slot_tile.id != 0) {
-        Rectangle src = { 0, 0, (float)gs->slot_tile.width, (float)gs->slot_tile.height };
-        Rectangle dst = { (float)x, (float)y, (float)w, (float)h };
-        DrawTexturePro(gs->slot_tile, src, dst, (Vector2){0,0}, 0.0f, WHITE);
-    } else {
-        gui_draw_slot(x, y, w, h, GUI_BG_SLOT);
-    }
+    Rectangle src = {0, 0, (float)gs->slot_tile.width, (float)gs->slot_tile.height};
+    Rectangle dst = {(float)x, (float)y, (float)w, (float)h};
+    DrawTexturePro(gs->slot_tile, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
 
-    /* draw item sprite if equipped, else slot silhouette */
     if (item_idx != ITEM_NONE && item_idx < NUM_ITEMS) {
-        Texture2D item_tex = gui_get_item_sprite(gs, item_idx);
-        if (item_tex.id != 0) {
-            gui_draw_tex_centered(item_tex, x, y, w, h);
-        } else {
-            const char* name = gui_item_short_name(item_idx);
-            gui_text_shadow(gs, name, x + 2, y + h / 2 - 4, 7, GUI_TEXT_YELLOW);
-        }
-    } else if (gs->sprites_loaded && gear_slot >= 0 && gear_slot < GUI_NUM_SLOT_SPRITES) {
-        Texture2D bg = gs->slot_sprites[gear_slot];
-        if (bg.id != 0) {
-            gui_draw_tex_centered(bg, x, y, w, h);
-        }
+        gui_draw_tex_centered(gui_get_item_sprite(gs, item_idx), x, y, w, h);
+        return;
     }
-}
 
+    assert(gear_slot >= 0 && gear_slot < GUI_NUM_SLOT_SPRITES);
+    gui_draw_tex_centered(gs->slot_sprites[gear_slot], x, y, w, h);
+}
 
 typedef struct {
     int logical_tab;
@@ -1385,7 +1173,6 @@ static Rectangle gui_side_component_rect(
 }
 
 static void gui_draw_texture(Texture2D tex, Rectangle dst, Color tint) {
-    if (tex.id == 0) return;
     Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
     DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0.0f, tint);
 }
@@ -1420,7 +1207,6 @@ static void gui_draw_texture_centered(
     float max_h,
     Color tint
 ) {
-    if (tex.id == 0) return;
     gui_draw_texture(tex, gui_texture_fit_rect(tex.width, tex.height, rect, max_w, max_h), tint);
 }
 
@@ -1428,7 +1214,7 @@ static void gui_draw_named_asset(GuiState* gs, const char* name, Rectangle dst, 
     gui_draw_texture(gui_asset(gs, name), dst, tint);
 }
 
-static int gui_draw_named_asset_centered(
+static void gui_draw_named_asset_centered(
     GuiState* gs,
     const char* name,
     Rectangle rect,
@@ -1437,17 +1223,11 @@ static int gui_draw_named_asset_centered(
     Color tint
 ) {
     Texture2D tex = gui_asset(gs, name);
-    if (tex.id == 0) return 0;
     gui_draw_texture_centered(tex, rect, max_w, max_h, tint);
-    return 1;
 }
 
 static void gui_draw_named_asset_tiled(GuiState* gs, const char* name, Rectangle dst, Color tint) {
     Texture2D tex = gui_asset(gs, name);
-    if (tex.id == 0) {
-        DrawRectangleRec(dst, GUI_BG_DARK);
-        return;
-    }
     for (float y = dst.y; y < dst.y + dst.height; y += (float)tex.height) {
         for (float x = dst.x; x < dst.x + dst.width; x += (float)tex.width) {
             float w = (x + tex.width > dst.x + dst.width) ? dst.x + dst.width - x : (float)tex.width;
@@ -1521,22 +1301,24 @@ static void gui_draw_ui_item_slot(GuiState* gs, const GuiUiItemSlot* slot, Recta
             gui_draw_named_asset_centered(gs, slot->empty_asset, rect, rect.width, rect.height, WHITE);
         }
     } else {
-        DrawRectangleRec(rect, (Color){0, 0, 0, 30});
         if (!slot->enabled) return;
 
-        Texture2D tex = {0};
+        Texture2D tex;
         if (slot->item_db_idx != ITEM_NONE) {
             tex = gui_get_item_sprite_for_quantity(gs, slot->item_db_idx, slot->quantity);
-        } else if (slot->osrs_id > 0) {
+        } else {
+            if (slot->osrs_id <= 0) {
+                fprintf(stderr, "GUI: invalid decoded item sprite raw asset ID %d\n",
+                    slot->osrs_id);
+                abort();
+            }
             tex = gui_get_sprite_by_osrs_id_for_quantity(gs, slot->osrs_id, slot->quantity);
         }
 
         Color tint = WHITE;
         tint.a = slot->alpha == 0 ? 255 : slot->alpha;
-        if (tex.id != 0) {
-            Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
-            DrawTexturePro(tex, src, rect, (Vector2){0, 0}, 0.0f, tint);
-        }
+        Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
+        DrawTexturePro(tex, src, rect, (Vector2){0, 0}, 0.0f, tint);
 
         if (slot->quantity > 1) {
             char text[16];
@@ -1586,7 +1368,6 @@ static void gui_draw_ui_sprite_component(
         int sprite_id = override && override->sprite_present ? override->sprite_id : component->sprite_id;
         tex = gui_sprite_asset(gs, sprite_id);
     }
-    if (tex.id == 0) return;
 
     if (rect.width <= 0) rect.width = (float)tex.width;
     if (rect.height <= 0) rect.height = (float)tex.height;
@@ -1737,9 +1518,9 @@ static void gui_draw_ui_component(
         if (component->type == 0 && gui_rect_has_area(rect)) {
             Rectangle prev = {0};
             int prev_active = 0;
-            gui_push_clip(clip, rect, &prev, &prev_active);
+            gui_push_clip(gs, clip, rect, &prev, &prev_active);
             gui_draw_ui_component(gs, group, child, child_rect, clip, overrides);
-            gui_pop_clip(clip, prev, prev_active);
+            gui_pop_clip(gs, clip, prev, prev_active);
         } else {
             gui_draw_ui_component(gs, group, child, child_rect, clip, overrides);
         }
@@ -1764,7 +1545,7 @@ static int gui_draw_ui_group(
     GuiUiClipState clip = {0};
     Rectangle prev = {0};
     int prev_active = 0;
-    gui_push_clip(&clip, mount, &prev, &prev_active);
+    gui_push_clip(gs, &clip, mount, &prev, &prev_active);
     for (int i = 0; i < group->component_count; i++) {
         const OsrsUiComponent* component = &group->components[i];
         if (component->parent_id != -1) continue;
@@ -1772,7 +1553,7 @@ static int gui_draw_ui_group(
             component, mount, osrs_ui_component_uses_mount_rect(component));
         gui_draw_ui_component(gs, group, component, rect, &clip, overrides);
     }
-    gui_pop_clip(&clip, prev, prev_active);
+    gui_pop_clip(gs, &clip, prev, prev_active);
     return 1;
 }
 
@@ -1843,24 +1624,19 @@ static int gui_handle_tab_click(GuiState* gs, int mouse_x, int mouse_y) {
     return 0;
 }
 
-
 static int gui_content_y(GuiState* gs) {
     return gs->panel_y + gs->status_bar_h + gs->tab_h;
 }
 
-
-/* inventory grid: OSRS native static-pixel layout */
 #define INV_COLS 4
-#define INV_ROWS 7
 #define INV_PANEL_CONTENT_X GUI_SIDE_CONTENT_X
-#define INV_SLOT_X 14
+#define INV_SLOT_X 16
 #define INV_SLOT_Y 8
 #define INV_CELL_W 42
 #define INV_CELL_H 36
-#define INV_SPRITE_W 32
+#define INV_SPRITE_W 36
 #define INV_SPRITE_H 32
 
-/** Get the OSRS item ID for a consumable based on remaining doses/count. */
 static int gui_consumable_osrs_id(InvSlotType type, int doses) {
     switch (type) {
         case INV_SLOT_FOOD:       return OSRS_ID_SHARK;
@@ -1911,8 +1687,6 @@ static int gui_consumable_osrs_id(InvSlotType type, int doses) {
     }
 }
 
-/** Find first empty slot in inventory grid (scanning left→right, top→bottom).
-    Returns -1 if inventory is full. */
 static int gui_inv_first_empty(GuiState* gs) {
     for (int i = 0; i < INV_GRID_SLOTS; i++) {
         if (gs->inv_grid[i].type == INV_SLOT_EMPTY) return i;
@@ -1920,8 +1694,6 @@ static int gui_inv_first_empty(GuiState* gs) {
     return -1;
 }
 
-/** Find the slot index of an equipment item in the inventory grid.
-    Returns -1 if not found. */
 static int gui_inv_find_equipment(GuiState* gs, uint8_t item_db_idx) {
     for (int i = 0; i < INV_GRID_SLOTS; i++) {
         if (gs->inv_grid[i].type == INV_SLOT_EQUIPMENT &&
@@ -1930,10 +1702,6 @@ static int gui_inv_find_equipment(GuiState* gs, uint8_t item_db_idx) {
     return -1;
 }
 
-/** Remove the last occurrence of a consumable type from the inventory grid.
-    In OSRS, eating removes from the slot the item is in — we remove from the
-    last slot of that type (bottom-right first) since that's where the cursor
-    typically is when spam-eating. Returns 1 if removed, 0 if not found. */
 static int gui_inv_remove_last_consumable(GuiState* gs, InvSlotType type) {
     for (int i = INV_GRID_SLOTS - 1; i >= 0; i--) {
         if (gs->inv_grid[i].type == type) {
@@ -1946,8 +1714,6 @@ static int gui_inv_remove_last_consumable(GuiState* gs, InvSlotType type) {
     return 0;
 }
 
-/** Place an equipment item into the inventory grid at the first empty slot.
-    Returns the slot index, or -1 if full. */
 static int gui_inv_place_equipment(GuiState* gs, uint8_t item_db_idx) {
     int slot = gui_inv_first_empty(gs);
     if (slot < 0) return -1;
@@ -1957,7 +1723,6 @@ static int gui_inv_place_equipment(GuiState* gs, uint8_t item_db_idx) {
     return slot;
 }
 
-/** Copy the player-side inventory snapshot that incremental GUI updates diff against. */
 static void gui_snapshot_inventory_state(GuiState* gs, const Player* p) {
     memcpy(gs->inv_prev_equipped, p->equipped, NUM_GEAR_SLOTS);
     gs->inv_prev_food_count = p->food_count;
@@ -1973,7 +1738,6 @@ static void gui_snapshot_inventory_state(GuiState* gs, const Player* p) {
     gs->inv_prev_saturated_heart_count = p->saturated_heart_count;
 }
 
-/** Return 1 when any inventory-tracked consumable count changed. */
 static int gui_inventory_consumables_changed(const GuiState* gs, const Player* p) {
     return p->food_count != gs->inv_prev_food_count
         || p->karambwan_count != gs->inv_prev_karambwan_count
@@ -1988,7 +1752,6 @@ static int gui_inventory_consumables_changed(const GuiState* gs, const Player* p
         || p->saturated_heart_count != gs->inv_prev_saturated_heart_count;
 }
 
-/** Clear inventory-only GUI state that must not leak across resets. */
 static void gui_reset_inventory_ui_state(GuiState* gs) {
     gs->inv_grid_dirty = 1;
     gs->human_clicked_inv_slot = -1;
@@ -2000,98 +1763,71 @@ static void gui_reset_inventory_ui_state(GuiState* gs) {
     gs->inv_drag_start_y = 0;
     gs->inv_drag_mouse_x = 0;
     gs->inv_drag_mouse_y = 0;
+    gs->inv_drag_press_time = 0.0;
     for (int i = 0; i < GUI_TAB_COUNT; i++) {
         gs->tab_press_timer[i] = 0;
     }
 }
 
-/** Full inventory grid build from player state. Called once at reset.
-    Equipment items go first (unequipped gear), then consumables.
-    After this, use gui_update_inventory() for incremental changes. */
 static void gui_populate_inventory(GuiState* gs, Player* p) {
     memset(gs->inv_grid, 0, sizeof(gs->inv_grid));
-    int n = 0;
-
-    /* unequipped gear items from the slot inventory */
-    for (int s = 0; s < NUM_GEAR_SLOTS && n < INV_GRID_SLOTS; s++) {
-        for (int i = 0; i < p->num_items_in_slot[s] && n < INV_GRID_SLOTS; i++) {
-            uint8_t item = p->inventory[s][i];
-            if (item == ITEM_NONE) continue;
-            /* skip if currently equipped */
-            int is_equipped = 0;
-            for (int e = 0; e < NUM_GEAR_SLOTS; e++) {
-                if (p->equipped[e] == item) { is_equipped = 1; break; }
-            }
-            if (is_equipped) continue;
-            /* skip duplicates */
-            int dup = 0;
-            for (int j = 0; j < n; j++) {
-                if (gs->inv_grid[j].type == INV_SLOT_EQUIPMENT &&
-                    gs->inv_grid[j].item_db_idx == item) { dup = 1; break; }
-            }
-            if (dup) continue;
-            gs->inv_grid[n].type = INV_SLOT_EQUIPMENT;
-            gs->inv_grid[n].item_db_idx = item;
-            gs->inv_grid[n].osrs_id = ITEM_DATABASE[item].item_id;
-            n++;
+    for (int cell = 0; cell < OSRS_INVENTORY_SIZE &&
+            cell < INV_GRID_SLOTS; cell++) {
+        const OsrsItemContentMetadata* metadata =
+            osrs_inventory_cell_metadata(&p->inventory_cells[cell]);
+        if (metadata->item_idx != ITEM_NONE) {
+            gs->inv_grid[cell].type = INV_SLOT_EQUIPMENT;
+            gs->inv_grid[cell].item_db_idx = metadata->item_idx;
+            gs->inv_grid[cell].osrs_id =
+                ITEM_DATABASE[metadata->item_idx].item_id;
+            continue;
+        }
+        gs->inv_grid[cell].osrs_id = metadata->raw_osrs_id;
+        switch ((OsrsConsumableKind)metadata->consumable_kind) {
+            case OSRS_CONSUMABLE_SHARK_FOOD:
+                gs->inv_grid[cell].type = INV_SLOT_FOOD;
+                break;
+            case OSRS_CONSUMABLE_KARAMBWAN:
+                gs->inv_grid[cell].type = INV_SLOT_KARAMBWAN;
+                break;
+            case OSRS_CONSUMABLE_BREW:
+                gs->inv_grid[cell].type = INV_SLOT_BREW;
+                break;
+            case OSRS_CONSUMABLE_SUPER_RESTORE:
+                gs->inv_grid[cell].type = INV_SLOT_RESTORE;
+                break;
+            case OSRS_CONSUMABLE_SUPER_COMBAT:
+            case OSRS_CONSUMABLE_DIVINE_COMBAT:
+                gs->inv_grid[cell].type = INV_SLOT_COMBAT_POT;
+                break;
+            case OSRS_CONSUMABLE_RANGING:
+            case OSRS_CONSUMABLE_DIVINE_RANGING:
+                gs->inv_grid[cell].type = INV_SLOT_RANGED_POT;
+                break;
+            case OSRS_CONSUMABLE_BASTION:
+                gs->inv_grid[cell].type = INV_SLOT_BASTION_POT;
+                break;
+            case OSRS_CONSUMABLE_STAMINA:
+                gs->inv_grid[cell].type = INV_SLOT_STAMINA_POT;
+                break;
+            case OSRS_CONSUMABLE_ANTIVENOM_PLUS:
+                gs->inv_grid[cell].type = INV_SLOT_ANTIVENOM;
+                break;
+            case OSRS_CONSUMABLE_PRAYER_RESTORE:
+                gs->inv_grid[cell].type = INV_SLOT_PRAYER_POT;
+                break;
+            case OSRS_CONSUMABLE_SATURATED_HEART:
+                gs->inv_grid[cell].type = INV_SLOT_SATURATED_HEART;
+                break;
+            default:
+                break;
         }
     }
-
-    /* consumables: food/potions are NOT stackable in OSRS.
-       each shark = 1 slot. each potion vial = 1 slot (with dose-specific sprite).
-       total doses are split into individual vials: e.g. 7 brew doses = 1x3-dose + 1x4-dose. */
-
-    /* food: each unit = 1 slot */
-    for (int i = 0; i < p->food_count && n < INV_GRID_SLOTS; i++) {
-        gs->inv_grid[n].type = INV_SLOT_FOOD;
-        gs->inv_grid[n].osrs_id = OSRS_ID_SHARK;
-        n++;
-    }
-    for (int i = 0; i < p->karambwan_count && n < INV_GRID_SLOTS; i++) {
-        gs->inv_grid[n].type = INV_SLOT_KARAMBWAN;
-        gs->inv_grid[n].osrs_id = OSRS_ID_KARAMBWAN;
-        n++;
-    }
-
-    /* potions: split doses into individual vials (4-dose first, remainder last) */
-    #define ADD_POTION_VIALS(doses_total, slot_type) do { \
-        int _rem = (doses_total); \
-        while (_rem > 0 && n < INV_GRID_SLOTS) { \
-            int _d = (_rem >= 4) ? 4 : _rem; \
-            gs->inv_grid[n].type = (slot_type); \
-            gs->inv_grid[n].osrs_id = gui_consumable_osrs_id((slot_type), _d); \
-            _rem -= _d; \
-            n++; \
-        } \
-    } while(0)
-
-    ADD_POTION_VIALS(p->brew_doses, INV_SLOT_BREW);
-    ADD_POTION_VIALS(p->restore_doses, INV_SLOT_RESTORE);
-    ADD_POTION_VIALS(p->combat_potion_doses, INV_SLOT_COMBAT_POT);
-    ADD_POTION_VIALS(p->ranged_potion_doses, INV_SLOT_RANGED_POT);
-    ADD_POTION_VIALS(p->bastion_doses, INV_SLOT_BASTION_POT);
-    ADD_POTION_VIALS(p->stamina_doses, INV_SLOT_STAMINA_POT);
-    ADD_POTION_VIALS(p->antivenom_doses, INV_SLOT_ANTIVENOM);
-    ADD_POTION_VIALS(p->prayer_pot_doses, INV_SLOT_PRAYER_POT);
-    #undef ADD_POTION_VIALS
-
-    for (int i = 0; i < p->saturated_heart_count && n < INV_GRID_SLOTS; i++) {
-        gs->inv_grid[n].type = INV_SLOT_SATURATED_HEART;
-        gs->inv_grid[n].osrs_id = OSRS_ID_SATURATED_HEART;
-        n++;
-    }
-
-    /* snapshot player state for incremental change detection */
     gui_snapshot_inventory_state(gs, p);
 }
 
-/** Update potion vial doses in-place when doses change.
-    E.g. drinking 1 dose from a 4-dose brew changes it to 3-dose (different sprite).
-    When human_clicked_inv_slot targets a vial of this type, that specific vial loses
-    the dose first (OSRS behavior: you drink from the vial you clicked). */
 static void gui_inv_update_potion_doses(GuiState* gs, InvSlotType type,
                                          int total_doses) {
-    /* collect existing vials of this type */
     int vial_slots[INV_GRID_SLOTS];
     int vial_count = 0;
     for (int i = 0; i < INV_GRID_SLOTS; i++) {
@@ -2101,10 +1837,8 @@ static void gui_inv_update_potion_doses(GuiState* gs, InvSlotType type,
     }
     if (vial_count == 0) return;
 
-    /* figure out how many doses were lost */
     int old_total = 0;
     for (int v = 0; v < vial_count; v++) {
-        /* reverse-lookup current dose count from OSRS ID */
         int oid = gs->inv_grid[vial_slots[v]].osrs_id;
         int d4 = gui_consumable_osrs_id(type, 4);
         int d3 = gui_consumable_osrs_id(type, 3);
@@ -2117,11 +1851,9 @@ static void gui_inv_update_potion_doses(GuiState* gs, InvSlotType type,
     }
     int doses_lost = old_total - total_doses;
 
-    /* if a human clicked a specific vial of this type, decrement that one first */
     int clicked = gs->human_clicked_inv_slot;
     if (doses_lost > 0 && clicked >= 0 && clicked < INV_GRID_SLOTS &&
         gs->inv_grid[clicked].type == type) {
-        /* find current dose count of clicked vial */
         int oid = gs->inv_grid[clicked].osrs_id;
         int cur_dose = 0;
         for (int d = 4; d >= 1; d--) {
@@ -2141,11 +1873,9 @@ static void gui_inv_update_potion_doses(GuiState* gs, InvSlotType type,
         }
     }
 
-    /* if doses still need removing (non-human or multiple doses lost),
-       take from remaining vials in reverse order (last first) */
     for (int v = vial_count - 1; v >= 0 && doses_lost > 0; v--) {
         int slot = vial_slots[v];
-        if (slot == clicked) continue; /* already handled */
+        if (slot == clicked) continue;
         if (gs->inv_grid[slot].type != type) continue;
         int oid = gs->inv_grid[slot].osrs_id;
         int cur_dose = 0;
@@ -2166,47 +1896,38 @@ static void gui_inv_update_potion_doses(GuiState* gs, InvSlotType type,
     }
 }
 
-/** Incremental inventory update. Detects gear switches and consumable changes
-    by comparing against the previous snapshot, then modifies only affected slots.
-    Items stay in their assigned positions — no compaction on eat/drink.
+static int gui_player_loadout_contains(const Player* p, uint8_t item_db_idx) {
+    for (int cell = 0; cell < OSRS_INVENTORY_SIZE; cell++) {
+        if (osrs_inventory_cell_item_index(
+                &p->inventory_cells[cell]) == item_db_idx)
+            return 1;
+    }
+    for (int slot = 0; slot < NUM_GEAR_SLOTS; slot++)
+        if (p->equipped[slot] == item_db_idx) return 1;
+    return 0;
+}
 
-    OSRS gear swap rule: when you click an inventory item to equip it, the
-    previously equipped item goes into that exact inventory slot (direct swap).
-    Exception: equipping a 2H weapon while a shield is equipped — the shield
-    goes to the first empty inventory slot since it wasn't directly clicked. */
 static void gui_update_inventory(GuiState* gs, Player* p) {
-    /* --- gear switches: direct slot swaps --- */
     for (int s = 0; s < NUM_GEAR_SLOTS; s++) {
         uint8_t prev = gs->inv_prev_equipped[s];
         uint8_t curr = p->equipped[s];
         if (prev == curr) continue;
 
         if (curr != ITEM_NONE && prev != ITEM_NONE) {
-            /* swap: new item was in inventory, old item takes its exact slot */
             int src = gui_inv_find_equipment(gs, curr);
             if (src >= 0) {
-                /* check if old item is still a valid swap item */
-                int in_loadout = 0;
-                for (int g = 0; g < NUM_GEAR_SLOTS; g++) {
-                    for (int i = 0; i < p->num_items_in_slot[g]; i++) {
-                        if (p->inventory[g][i] == prev) { in_loadout = 1; break; }
-                    }
-                    if (in_loadout) break;
-                }
+                int in_loadout = gui_player_loadout_contains(p, prev);
                 if (in_loadout) {
-                    /* direct swap: old item goes into the slot the new item came from */
                     gs->inv_grid[src].type = INV_SLOT_EQUIPMENT;
                     gs->inv_grid[src].item_db_idx = prev;
                     gs->inv_grid[src].osrs_id = ITEM_DATABASE[prev].item_id;
                 } else {
-                    /* old item not in loadout — just clear the slot */
                     gs->inv_grid[src].type = INV_SLOT_EMPTY;
                     gs->inv_grid[src].item_db_idx = 0;
                     gs->inv_grid[src].osrs_id = 0;
                 }
             }
         } else if (curr != ITEM_NONE) {
-            /* equipping from inventory, nothing was in this gear slot before */
             int src = gui_inv_find_equipment(gs, curr);
             if (src >= 0) {
                 gs->inv_grid[src].type = INV_SLOT_EMPTY;
@@ -2214,28 +1935,16 @@ static void gui_update_inventory(GuiState* gs, Player* p) {
                 gs->inv_grid[src].osrs_id = 0;
             }
         } else if (prev != ITEM_NONE) {
-            /* gear slot cleared (e.g. shield removed by 2H weapon equip).
-               the old item goes to the first empty inventory slot. */
-            int in_loadout = 0;
-            for (int g = 0; g < NUM_GEAR_SLOTS; g++) {
-                for (int i = 0; i < p->num_items_in_slot[g]; i++) {
-                    if (p->inventory[g][i] == prev) { in_loadout = 1; break; }
-                }
-                if (in_loadout) break;
-            }
+            int in_loadout = gui_player_loadout_contains(p, prev);
             if (in_loadout && gui_inv_find_equipment(gs, prev) < 0) {
                 gui_inv_place_equipment(gs, prev);
             }
         }
     }
 
-    /* --- consumable changes: remove clicked slot or fall back to last --- */
-
-    /* if a human clicked a specific consumable slot, remove that exact slot first */
     int clicked = gs->human_clicked_inv_slot;
     int clicked_used = 0;
 
-    /* food */
     int food_diff = gs->inv_prev_food_count - p->food_count;
     for (int i = 0; i < food_diff; i++) {
         if (!clicked_used && clicked >= 0 && clicked < INV_GRID_SLOTS &&
@@ -2249,7 +1958,6 @@ static void gui_update_inventory(GuiState* gs, Player* p) {
         }
     }
 
-    /* karambwan */
     int karam_diff = gs->inv_prev_karambwan_count - p->karambwan_count;
     for (int i = 0; i < karam_diff; i++) {
         if (!clicked_used && clicked >= 0 && clicked < INV_GRID_SLOTS &&
@@ -2263,9 +1971,6 @@ static void gui_update_inventory(GuiState* gs, Player* p) {
         }
     }
 
-    /* potions: dose changes update existing vials in-place (sprite change),
-       and remove empty vials when a full vial is consumed.
-       human_clicked_inv_slot is still set here so the clicked vial loses the dose. */
     if (p->brew_doses != gs->inv_prev_brew_doses) {
         gui_inv_update_potion_doses(gs, INV_SLOT_BREW, p->brew_doses);
     }
@@ -2300,17 +2005,13 @@ static void gui_update_inventory(GuiState* gs, Player* p) {
         gs->inv_grid[slot].osrs_id = OSRS_ID_SATURATED_HEART;
     }
 
-    /* only clear human click when a consumable was actually used this frame.
-       if no diff happened yet, keep it for the next tick when the sim processes the action. */
     if (clicked_used || gui_inventory_consumables_changed(gs, p)) {
         gs->human_clicked_inv_slot = -1;
     }
 
-    /* update snapshot */
     gui_snapshot_inventory_state(gs, p);
 }
 
-/** Get the inventory grid screen position for a slot index. */
 static void gui_inv_slot_pos(GuiState* gs, int slot, int* out_x, int* out_y) {
     int grid_x = gs->panel_x + INV_PANEL_CONTENT_X + INV_SLOT_X;
     int grid_y = gui_content_y(gs) + INV_SLOT_Y;
@@ -2320,22 +2021,59 @@ static void gui_inv_slot_pos(GuiState* gs, int slot, int* out_x, int* out_y) {
     *out_y = grid_y + row * INV_CELL_H;
 }
 
-/** Hit test: return inventory slot index at screen position, or -1. */
 static int gui_inv_slot_at(GuiState* gs, int mx, int my) {
     for (int i = 0; i < INV_GRID_SLOTS; i++) {
         int sx, sy;
         gui_inv_slot_pos(gs, i, &sx, &sy);
-        if (mx >= sx && mx < sx + INV_CELL_W && my >= sy && my < sy + INV_CELL_H) {
+        if (mx >= sx && mx < sx + INV_SPRITE_W && my >= sy && my < sy + INV_SPRITE_H) {
             return i;
         }
     }
     return -1;
 }
 
+static uint16_t gui_inventory_raw_osrs_id(int osrs_id) {
+    if (osrs_id < 0 || osrs_id > UINT16_MAX) {
+        fprintf(stderr, "gui inventory: invalid raw OSRS id %d\n", osrs_id);
+        abort();
+    }
+    return (uint16_t)osrs_id;
+}
+
 static const char* gui_inv_primary_action_label(const InvSlot* inv) {
+    uint16_t raw_osrs_id =
+        gui_inventory_raw_osrs_id(inv->osrs_id);
+    uint8_t item_idx = inv->type == INV_SLOT_EQUIPMENT
+        ? inv->item_db_idx
+        : ITEM_NONE;
+    OsrsInventoryCell cell = item_idx == ITEM_NONE
+        ? osrs_inventory_cell_from_raw_osrs_id(raw_osrs_id)
+        : osrs_inventory_cell_from_item(item_idx);
+    OsrsInventoryClickResolution resolution =
+        osrs_inventory_cell_click_interpret(
+            &cell, OSRS_CLICK_TICK_FIRST);
+    switch (resolution.click_action) {
+        case OSRS_CLICK_EQUIP: {
+            int gear_slot = item_idx != ITEM_NONE ? osrs_item_gear_slot(item_idx) : -1;
+            return gear_slot == GEAR_SLOT_WEAPON || gear_slot == GEAR_SLOT_AMMO
+                ? "Wield"
+                : "Wear";
+        }
+        case OSRS_CLICK_EAT:
+            return "Eat";
+        case OSRS_CLICK_DRINK:
+            return "Drink";
+        case OSRS_CLICK_NONE:
+            break;
+        default:
+            fprintf(stderr, "gui inventory: bad click action %d\n",
+                (int)resolution.click_action);
+            abort();
+    }
     switch (inv->type) {
         case INV_SLOT_EQUIPMENT: {
-            int gear_slot = item_to_gear_slot(inv->item_db_idx);
+            if (inv->item_db_idx == ITEM_NONE) return NULL;
+            int gear_slot = osrs_item_gear_slot(inv->item_db_idx);
             return gear_slot == GEAR_SLOT_WEAPON || gear_slot == GEAR_SLOT_AMMO
                 ? "Wield"
                 : "Wear";
@@ -2360,10 +2098,34 @@ static const char* gui_inv_primary_action_label(const InvSlot* inv) {
     }
 }
 
+static const char* gui_inv_raw_osrs_id_display_name(int osrs_id) {
+    switch (osrs_id) {
+        case 27610:
+            return "Venator bow";
+        case 12006:
+            return "Abyssal tentacle";
+        case 27281:
+            return "Divine rune pouch";
+        case 23685:
+            return "Divine super combat";
+        case 23733:
+            return "Divine ranging potion";
+        case 10925:
+            return "Sanfew serum";
+        case 4417:
+            return "Guthix rest";
+        case 30875:
+            return "Surge potion";
+        default:
+            return "";
+    }
+}
+
 static const char* gui_inv_slot_display_name(const InvSlot* inv) {
     switch (inv->type) {
         case INV_SLOT_EQUIPMENT:
-            return gui_item_short_name(inv->item_db_idx);
+            if (inv->item_db_idx != ITEM_NONE) return gui_item_short_name(inv->item_db_idx);
+            return gui_inv_raw_osrs_id_display_name(inv->osrs_id);
         case INV_SLOT_FOOD:
             return "Shark";
         case INV_SLOT_KARAMBWAN:
@@ -2392,7 +2154,6 @@ static const char* gui_inv_slot_display_name(const InvSlot* inv) {
     }
 }
 
-/** Select an inventory item as the source for the next item target click. */
 static int gui_inv_select_item(GuiState* gs, HumanInput* hi, int slot) {
     if (!hi || !hi->enabled) return 0;
     if (slot < 0 || slot >= INV_GRID_SLOTS) return 0;
@@ -2412,23 +2173,15 @@ static int gui_inv_select_item(GuiState* gs, HumanInput* hi, int slot) {
     return 1;
 }
 
-/** Handle inventory click: equip gear items, eat/drink consumables.
-    hi is a HumanInput* (from osrs_pvp_human_input_types.h, included above).
-    When non-NULL and enabled, food/potion clicks set pending_* fields instead of
-    directly mutating player state, so the action system handles timers. */
-
 static InvAction gui_inv_click(GuiState* gs, Player* p, int slot,
                                 HumanInput* hi) {
     if (slot < 0 || slot >= INV_GRID_SLOTS) return INV_ACTION_NONE;
     InvSlot* inv = &gs->inv_grid[slot];
     if (inv->type == INV_SLOT_EMPTY) return INV_ACTION_NONE;
 
-    /* start dim animation */
     gs->inv_dim_slot = slot;
     gs->inv_dim_timer = INV_DIM_TICKS;
 
-    /* when human control is active, route food/potion through action system
-       instead of directly mutating player state (respects timers) */
     int human_active = (hi && hi->enabled);
     if (human_active && hi->cursor_mode == CURSOR_ITEM_TARGET) {
         OsrsUiIntent intent = osrs_ui_intent_item_on_item(
@@ -2442,7 +2195,12 @@ static InvAction gui_inv_click(GuiState* gs, Player* p, int slot,
 
     switch (inv->type) {
         case INV_SLOT_EQUIPMENT: {
-            int gear_slot = item_to_gear_slot(inv->item_db_idx);
+            if (human_active && gs->display_inventory_count > 0) {
+                human_input_queue_inventory_primary_click(hi, slot);
+                gs->human_clicked_inv_slot = slot;
+                return INV_ACTION_EQUIP;
+            }
+            int gear_slot = osrs_item_gear_slot(inv->item_db_idx);
             if (gear_slot >= 0) {
                 if (human_active) {
                     human_input_queue_equip_inventory_item(hi, slot, inv->item_db_idx, gear_slot);
@@ -2456,18 +2214,18 @@ static InvAction gui_inv_click(GuiState* gs, Player* p, int slot,
         case INV_SLOT_FOOD:
             if (human_active) {
                 hi->pending_food = 1;
-                human_input_queue_eat(hi, 0);
+                human_input_queue_eat(hi, 0, slot);
                 gs->human_clicked_inv_slot = slot;
             }
-            else { eat_food(p, 0); }
+            else { osrs_player_eat_food_type(p, FOOD_SHARK); }
             return INV_ACTION_EAT;
         case INV_SLOT_KARAMBWAN:
             if (human_active) {
                 hi->pending_karambwan = 1;
-                human_input_queue_eat(hi, 1);
+                human_input_queue_eat(hi, 1, slot);
                 gs->human_clicked_inv_slot = slot;
             }
-            else { eat_food(p, 1); }
+            else { osrs_player_eat_food_type(p, FOOD_KARAMBWAN); }
             return INV_ACTION_EAT;
         case INV_SLOT_BREW:
             if (human_active) {
@@ -2530,60 +2288,65 @@ static InvAction gui_inv_click(GuiState* gs, Player* p, int slot,
     }
 }
 
-/** Handle inventory mouse input: clicks, drag start/move/release.
-    When hi is non-NULL and enabled, food/potion clicks route through the
-    action system instead of directly mutating player state. */
 static void gui_inv_handle_mouse(GuiState* gs, Player* p, HumanInput* hi) {
     if (gs->active_tab != GUI_TAB_INVENTORY) return;
 
-    int mx = GetMouseX();
-    int my = GetMouseY();
+    int mx, my;
+    gui_mouse_to_panel_space(gs, GetMouseX(), GetMouseY(), &mx, &my);
 
-    /* drag in progress */
     if (gs->inv_drag_active) {
         gs->inv_drag_mouse_x = mx;
         gs->inv_drag_mouse_y = my;
 
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            /* drop: swap src and target slots */
             int target = gui_inv_slot_at(gs, mx, my);
             if (target >= 0 && target != gs->inv_drag_src_slot) {
+                InvSlot source = gs->inv_grid[gs->inv_drag_src_slot];
+                if (hi && hi->enabled) {
+                    human_input_queue_item_on_item(
+                        hi,
+                        gs->inv_drag_src_slot,
+                        target,
+                        source.type == INV_SLOT_EQUIPMENT
+                            ? source.item_db_idx
+                            : ITEM_NONE,
+                        source.osrs_id);
+                }
                 InvSlot tmp = gs->inv_grid[target];
                 gs->inv_grid[target] = gs->inv_grid[gs->inv_drag_src_slot];
                 gs->inv_grid[gs->inv_drag_src_slot] = tmp;
             }
-            gs->inv_drag_active = 0;
-            gs->inv_drag_src_slot = -1;
+            osrs_inventory_drag_release(
+                &gs->inv_drag_active,
+                &gs->inv_drag_src_slot,
+                &gs->inv_dim_slot,
+                &gs->inv_dim_timer);
         }
         return;
     }
 
-    /* new click */
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         int slot = gui_inv_slot_at(gs, mx, my);
         if (slot >= 0 && gs->inv_grid[slot].type != INV_SLOT_EMPTY) {
             gs->inv_drag_start_x = mx;
             gs->inv_drag_start_y = my;
             gs->inv_drag_src_slot = slot;
+            gs->inv_drag_press_time = GetTime();
         }
     }
 
-    /* check if held mouse has moved past dead zone → start drag */
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && gs->inv_drag_src_slot >= 0 && !gs->inv_drag_active) {
-        int dx = mx - gs->inv_drag_start_x;
-        int dy = my - gs->inv_drag_start_y;
-        if (dx > INV_DRAG_DEAD_ZONE || dx < -INV_DRAG_DEAD_ZONE ||
-            dy > INV_DRAG_DEAD_ZONE || dy < -INV_DRAG_DEAD_ZONE) {
-            gs->inv_drag_active = 1;
-            gs->inv_drag_mouse_x = mx;
-            gs->inv_drag_mouse_y = my;
-            /* dim the source slot during drag */
-            gs->inv_dim_slot = gs->inv_drag_src_slot;
-            gs->inv_dim_timer = 9999;  /* stays dim during entire drag */
-        }
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && gs->inv_drag_src_slot >= 0 &&
+            !gs->inv_drag_active && osrs_inventory_drag_ready(
+                GetTime() - gs->inv_drag_press_time,
+                mx - gs->inv_drag_start_x,
+                my - gs->inv_drag_start_y)) {
+        gs->inv_drag_active = 1;
+        gs->inv_drag_mouse_x = mx;
+        gs->inv_drag_mouse_y = my;
+        gs->inv_dim_slot = gs->inv_drag_src_slot;
+        gs->inv_dim_timer = 9999;
     }
 
-    /* click release without drag = activate item */
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && gs->inv_drag_src_slot >= 0 && !gs->inv_drag_active) {
         gui_inv_click(gs, p, gs->inv_drag_src_slot, hi);
         gs->inv_drag_src_slot = -1;
@@ -2630,27 +2393,15 @@ static GuiUiItemSlot gui_ui_slot_from_inv_slot(const GuiState* gs, const InvSlot
 static void gui_draw_inventory_drag(GuiState* gs) {
     if (!(gs->inv_drag_active && gs->inv_drag_src_slot >= 0)) return;
     InvSlot* drag = &gs->inv_grid[gs->inv_drag_src_slot];
-    Texture2D tex = {0};
-    if (drag->type == INV_SLOT_EQUIPMENT) {
-        tex = gui_get_item_sprite(gs, drag->item_db_idx);
-    } else {
-        tex = gui_get_sprite_by_osrs_id(gs, drag->osrs_id);
-    }
-    if (tex.id != 0) {
-        int dx = gs->inv_drag_mouse_x - INV_SPRITE_W / 2;
-        int dy = gs->inv_drag_mouse_y - INV_SPRITE_H / 2;
-        Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
-        Rectangle dst = {(float)dx, (float)dy, (float)INV_SPRITE_W, (float)INV_SPRITE_H};
-        DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0.0f,
-            CLITERAL(Color){255, 255, 255, 200});
-    }
-
-    int target = gui_inv_slot_at(gs, gs->inv_drag_mouse_x, gs->inv_drag_mouse_y);
-    if (target >= 0 && target != gs->inv_drag_src_slot) {
-        int tx, ty;
-        gui_inv_slot_pos(gs, target, &tx, &ty);
-        DrawRectangle(tx, ty, INV_CELL_W, INV_CELL_H, CLITERAL(Color){255, 255, 255, 40});
-    }
+    Texture2D tex = drag->type == INV_SLOT_EQUIPMENT
+        ? gui_get_item_sprite(gs, drag->item_db_idx)
+        : gui_get_sprite_by_osrs_id(gs, drag->osrs_id);
+    int dx = gs->inv_drag_mouse_x - INV_SPRITE_W / 2;
+    int dy = gs->inv_drag_mouse_y - INV_SPRITE_H / 2;
+    Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
+    Rectangle dst = {(float)dx, (float)dy, (float)INV_SPRITE_W, (float)INV_SPRITE_H};
+    DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0.0f,
+        CLITERAL(Color){255, 255, 255, 200});
 }
 
 static int gui_draw_inventory_decoded(GuiState* gs) {
@@ -2658,8 +2409,8 @@ static int gui_draw_inventory_decoded(GuiState* gs) {
         .component_id = OSRS_UI_COMPONENT_ID(OSRS_UI_GROUP_INVENTORY, 0),
         .slot_count = INV_GRID_SLOTS,
         .columns = 4,
-        .x0 = 14,
-        .y0 = 8,
+        .x0 = INV_SLOT_X,
+        .y0 = INV_SLOT_Y,
         .step_x = 42,
         .step_y = 36,
         .slot_w = INV_SPRITE_W,
@@ -2679,19 +2430,10 @@ static void gui_draw_inventory_manual(GuiState* gs) {
     for (int slot = 0; slot < INV_GRID_SLOTS; slot++) {
         int cx, cy;
         gui_inv_slot_pos(gs, slot, &cx, &cy);
-        int sx = cx + (INV_CELL_W - INV_SPRITE_W) / 2;
-        int sy = cy + (INV_CELL_H - INV_SPRITE_H) / 2;
-        DrawRectangle(sx, sy, INV_SPRITE_W, INV_SPRITE_H, CLITERAL(Color){0, 0, 0, 30});
-    }
-
-    for (int slot = 0; slot < INV_GRID_SLOTS; slot++) {
-        int cx, cy;
-        gui_inv_slot_pos(gs, slot, &cx, &cy);
         InvSlot* inv = &gs->inv_grid[slot];
 
         if (inv->type == INV_SLOT_EMPTY) continue;
 
-        /* determine sprite */
         Texture2D tex = { 0 };
         if (inv->type == INV_SLOT_EQUIPMENT) {
             tex = gui_get_item_sprite(gs, inv->item_db_idx);
@@ -2699,39 +2441,55 @@ static void gui_draw_inventory_manual(GuiState* gs) {
             tex = gui_get_sprite_by_osrs_id(gs, inv->osrs_id);
         }
 
-        /* dim tint: 50% alpha when clicked/dragged (matches OSRS var17=128) */
         int is_dimmed = (gs->inv_dim_slot == slot && gs->inv_dim_timer > 0);
         Color tint = is_dimmed ? CLITERAL(Color){ 255, 255, 255, 128 } : WHITE;
 
-        int dx = cx + (INV_CELL_W - INV_SPRITE_W) / 2;
-        int dy = cy + (INV_CELL_H - INV_SPRITE_H) / 2;
+        int dx = cx;
+        int dy = cy;
 
-        /* skip drawing at grid position if being dragged (drawn at cursor instead) */
+        Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
+        Rectangle dst = {(float)dx, (float)dy, (float)INV_SPRITE_W, (float)INV_SPRITE_H};
         if (gs->inv_drag_active && slot == gs->inv_drag_src_slot) {
-            if (tex.id != 0) {
-                Rectangle src = { 0, 0, (float)tex.width, (float)tex.height };
-                Rectangle dst = { (float)dx, (float)dy, (float)INV_SPRITE_W, (float)INV_SPRITE_H };
-                DrawTexturePro(tex, src, dst, (Vector2){0,0}, 0.0f,
-                               CLITERAL(Color){ 255, 255, 255, 80 });
-            }
+            DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0.0f,
+                CLITERAL(Color){255, 255, 255, 80});
             continue;
         }
 
-        if (tex.id != 0) {
-            Rectangle src = { 0, 0, (float)tex.width, (float)tex.height };
-            Rectangle dst = { (float)dx, (float)dy, (float)INV_SPRITE_W, (float)INV_SPRITE_H };
-            DrawTexturePro(tex, src, dst, (Vector2){0,0}, 0.0f, tint);
-        } else {
-            const char* name = (inv->type == INV_SLOT_EQUIPMENT)
-                ? gui_item_short_name(inv->item_db_idx) : "???";
-            gui_text_shadow(gs, name, cx + 2, cy + 12, 7, GUI_TEXT_YELLOW);
-        }
+        DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0.0f, tint);
     }
 
     gui_draw_inventory_drag(gs);
 }
 
+static void gui_load_display_inventory(GuiState* gs) {
+    memset(gs->inv_grid, 0, sizeof(gs->inv_grid));
+    int count = gs->display_inventory_count;
+    if (count > INV_GRID_SLOTS) count = INV_GRID_SLOTS;
+    for (int i = 0; i < count; i++) {
+        int osrs_id = gs->display_inventory_osrs_ids[i];
+        if (osrs_id == 0) continue;
+        const OsrsItemContentMetadata* metadata =
+            osrs_item_content_metadata(
+                osrs_inventory_content_code_from_raw_osrs_id(
+                    gui_inventory_raw_osrs_id(osrs_id)));
+        uint8_t item_idx = metadata->item_idx;
+        gs->inv_grid[i].type = INV_SLOT_EQUIPMENT;
+        gs->inv_grid[i].item_db_idx = item_idx;
+        gs->inv_grid[i].osrs_id = osrs_id;
+    }
+}
+
 static void gui_draw_inventory(GuiState* gs, Player* p) {
+    if (gs->display_inventory_count > 0) {
+        gui_load_display_inventory(gs);
+        gs->inv_grid_dirty = 0;
+        if (gui_draw_inventory_decoded(gs)) {
+            gui_draw_inventory_drag(gs);
+            return;
+        }
+        gui_draw_inventory_manual(gs);
+        return;
+    }
     if (gs->inv_grid_dirty) {
         gui_populate_inventory(gs, p);
         gs->inv_grid_dirty = 0;
@@ -2746,7 +2504,6 @@ static void gui_draw_inventory(GuiState* gs, Player* p) {
 
     gui_draw_inventory_manual(gs);
 }
-
 
 typedef struct {
     int gear_slot;
@@ -2819,9 +2576,6 @@ static int gui_draw_equipment_decoded(GuiState* gs, Player* p) {
         const GuiWornButtonRef* ref = &GUI_WORN_BUTTON_REFS[i];
         Rectangle rect = gui_side_component_rect(gs, "wornitems", ref->component_name, ref->rect);
         gui_draw_named_asset(gs, "combatboxes_0", rect, WHITE);
-        if (gui_asset(gs, "combatboxes_0").id == 0) {
-            gui_draw_slot((int)rect.x, (int)rect.y, (int)rect.width, (int)rect.height, GUI_BG_SLOT);
-        }
     }
 
     return gui_draw_ui_group(gs, "wornitems", gui_side_content_rect(gs), &ui_overrides);
@@ -2866,40 +2620,36 @@ static void gui_draw_equipment(GuiState* gs, Player* p) {
         Rectangle icon = gui_side_component_rect(
             gs, "wornitems", ref->icon_component_name, ref->icon_rect);
         gui_draw_named_asset(gs, "combatboxes_0", rect, WHITE);
-        if (gui_asset(gs, "combatboxes_0").id == 0) {
-            gui_draw_slot((int)rect.x, (int)rect.y, (int)rect.width, (int)rect.height, GUI_BG_SLOT);
-        }
         gui_draw_named_asset_centered(gs, ref->asset, icon, icon.width, icon.height, WHITE);
     }
 }
-
 
 #define GUI_PRAYER_GRID_COUNT GUI_NUM_PRAYERS
 
 #define GUI_PRAYER_GRID_COLS 5
 #define GUI_PRAYER_CELL_PX 34
-#define GUI_SPELL_GRID_COLS 4
-#define GUI_SPELL_CELL_PX 34
+#define GUI_PRAYER_ICON_PX 30
+#define GUI_PRAYER_GRID_X0 4
+#define GUI_PRAYER_GRID_Y0 9
+#define GUI_PRAYER_PITCH 37
 
-static int gui_fit_cell_size(int panel_w, int cols, int gap, int native_px) {
-    int fitted = (panel_w - 16 - gap * (cols - 1)) / cols;
-    return fitted < native_px ? fitted : native_px;
-}
+#define GUI_SPELL_GRID_COLS 4
+#define GUI_SPELL_ICON_PX 24
+#define GUI_SPELL_PITCH_X (24 + 20)
+#define GUI_SPELL_PITCH_Y (24 + 4)
+#define GUI_SPELL_GRID_X0 ((GUI_SIDE_CONTENT_W - (4 * GUI_SPELL_PITCH_X - 20)) / 2 + 2)
+#define GUI_SPELL_GRID_Y0 8
 
 static void gui_prayer_grid_metrics(GuiState* gs, int* gx, int* gy, int* cell, int* gap) {
-    *gap = 2;
+    *gap = GUI_PRAYER_PITCH - GUI_PRAYER_CELL_PX;
     *cell = GUI_PRAYER_CELL_PX;
-    *gx = gs->panel_x + GUI_SIDE_CONTENT_X + 8;
-    *gy = gui_content_y(gs) + 8;
+    *gx = gs->panel_x + GUI_SIDE_CONTENT_X + GUI_PRAYER_GRID_X0;
+    *gy = gui_content_y(gs) + GUI_PRAYER_GRID_Y0;
 }
 
-static void gui_spell_grid_metrics(GuiState* gs, int* gx, int* gy, int* cell, int* gap) {
-    *gap = 5;
-    *cell = gui_fit_cell_size(gs->panel_w, GUI_SPELL_GRID_COLS, *gap, GUI_SPELL_CELL_PX);
-    int grid_w = GUI_SPELL_GRID_COLS * *cell + (GUI_SPELL_GRID_COLS - 1) * *gap;
-    Rectangle content = gui_side_content_rect(gs);
-    *gx = (int)(content.x + (content.width - grid_w) / 2);
-    *gy = gui_content_y(gs) + 8;
+static void gui_spell_grid_origin(GuiState* gs, int* gx, int* gy) {
+    *gx = gs->panel_x + GUI_SIDE_CONTENT_X + GUI_SPELL_GRID_X0;
+    *gy = gui_content_y(gs) + GUI_SPELL_GRID_Y0;
 }
 
 typedef struct {
@@ -3032,10 +2782,6 @@ static Rectangle gui_combat_category_rect(void) {
 
 static void gui_draw_combat_box(GuiState* gs, Rectangle rect, int selected) {
     gui_draw_named_asset(gs, selected ? "combatboxes_1" : "combatboxes_0", rect, WHITE);
-    if (gui_asset(gs, selected ? "combatboxes_1" : "combatboxes_0").id == 0) {
-        DrawRectangleRec(rect, selected ? (Color){83, 61, 43, 245} : (Color){45, 39, 31, 235});
-        DrawRectangleLinesEx(rect, 1, selected ? GUI_TEXT_YELLOW : (Color){103, 89, 63, 255});
-    }
     if (selected) {
         DrawRectangleRec(rect, (Color){120, 27, 20, 54});
     }
@@ -3159,7 +2905,6 @@ static int gui_draw_combat_decoded(
     return gui_draw_ui_group(gs, "combat_interface", gui_side_content_rect(gs), &ui_overrides);
 }
 
-/** Check if a prayer grid slot is currently active based on player state. */
 static int gui_prayer_is_active(GuiPrayerIdx pidx, Player* p) {
     switch (pidx) {
         case GUI_PRAY_PROTECT_MAGIC:    return p->prayer == PRAYER_PROTECT_MAGIC;
@@ -3182,25 +2927,21 @@ static void gui_draw_prayer(GuiState* gs, Player* p) {
     for (int i = 0; i < GUI_PRAYER_GRID_COUNT; i++) {
         int col = i % cols;
         int row = i / cols;
-        int ix = gx + col * (icon_sz + gap);
-        int iy = gy + row * (icon_sz + gap);
+        int ix = gx + col * GUI_PRAYER_PITCH;
+        int iy = gy + row * GUI_PRAYER_PITCH;
 
         GuiPrayerIdx pidx = (GuiPrayerIdx)i;
         int active = gui_prayer_is_active(pidx, p);
         Rectangle cell_rect = {(float)ix, (float)iy, (float)icon_sz, (float)icon_sz};
 
-        DrawRectangleRec(cell_rect, (Color){16, 13, 10, 95});
         if (active) {
-            DrawRectangleRec(cell_rect, (Color){255, 224, 64, 34});
+            gui_draw_named_asset(gs, "prayerglow_0", cell_rect, WHITE);
         }
 
-        if (gs->sprites_loaded) {
-            Texture2D tex = active ? gs->prayer_on[pidx] : gs->prayer_off[pidx];
-            gui_draw_texture_centered(tex, cell_rect, 30, 30, WHITE);
-        }
+        gui_draw_texture_centered(gs->prayer_on[pidx], cell_rect,
+            GUI_PRAYER_ICON_PX, GUI_PRAYER_ICON_PX, WHITE);
     }
 }
-
 
 static void gui_draw_combat(GuiState* gs, Player* p) {
     const char* wpn_name = "Unarmed";
@@ -3288,9 +3029,6 @@ static void gui_draw_combat(GuiState* gs, Player* p) {
     Rectangle spec = gui_side_ref_rect(gs, gui_combat_special_rect());
     float spec_pct = (float)p->special_energy / 100.0f;
     gui_draw_named_asset(gs, "combatboxes_special_attack", spec, WHITE);
-    if (gui_asset(gs, "combatboxes_special_attack").id == 0) {
-        DrawRectangleRec(spec, (Color){32, 28, 22, 235});
-    }
     Rectangle empty = {spec.x + 2, spec.y + 7, spec.width - 4, 12};
     DrawRectangleRec(empty, (Color){115, 6, 6, 255});
     Rectangle fill = empty;
@@ -3316,7 +3054,6 @@ static void gui_draw_combat(GuiState* gs, Player* p) {
     }
 }
 
-
 typedef struct {
     const char* name;
     GuiSpellIdx idx;
@@ -3325,27 +3062,27 @@ typedef struct {
 static const GuiSpellEntry GUI_SPELL_GRID[] = {
     { "Smoke Rush",    GUI_SPELL_SMOKE_RUSH },
     { "Shadow Rush",   GUI_SPELL_SHADOW_RUSH },
+    { "Paddewwa Teleport",     GUI_SPELL_PADDEWWA_TELEPORT },
     { "Blood Rush",    GUI_SPELL_BLOOD_RUSH },
     { "Ice Rush",      GUI_SPELL_ICE_RUSH },
+    { "Senntisten Teleport",   GUI_SPELL_SENNTISTEN_TELEPORT },
     { "Smoke Burst",   GUI_SPELL_SMOKE_BURST },
     { "Shadow Burst",  GUI_SPELL_SHADOW_BURST },
+    { "Kharyrll Teleport",     GUI_SPELL_KHARYRLL_TELEPORT },
     { "Blood Burst",   GUI_SPELL_BLOOD_BURST },
     { "Ice Burst",     GUI_SPELL_ICE_BURST },
+    { "Lassar Teleport",       GUI_SPELL_LASSAR_TELEPORT },
     { "Smoke Blitz",   GUI_SPELL_SMOKE_BLITZ },
     { "Shadow Blitz",  GUI_SPELL_SHADOW_BLITZ },
+    { "Dareeyak Teleport",     GUI_SPELL_DAREEYAK_TELEPORT },
     { "Blood Blitz",   GUI_SPELL_BLOOD_BLITZ },
     { "Ice Blitz",     GUI_SPELL_ICE_BLITZ },
+    { "Carrallanger Teleport", GUI_SPELL_CARRALLANGER_TELEPORT },
     { "Smoke Barrage", GUI_SPELL_SMOKE_BARRAGE },
     { "Shadow Barrage",GUI_SPELL_SHADOW_BARRAGE },
+    { "Annakarl Teleport",     GUI_SPELL_ANNAKARL_TELEPORT },
     { "Blood Barrage", GUI_SPELL_BLOOD_BARRAGE },
     { "Ice Barrage",   GUI_SPELL_ICE_BARRAGE },
-    { "Paddewwa Teleport",     GUI_SPELL_PADDEWWA_TELEPORT },
-    { "Senntisten Teleport",   GUI_SPELL_SENNTISTEN_TELEPORT },
-    { "Kharyrll Teleport",     GUI_SPELL_KHARYRLL_TELEPORT },
-    { "Lassar Teleport",       GUI_SPELL_LASSAR_TELEPORT },
-    { "Dareeyak Teleport",     GUI_SPELL_DAREEYAK_TELEPORT },
-    { "Carrallanger Teleport", GUI_SPELL_CARRALLANGER_TELEPORT },
-    { "Annakarl Teleport",     GUI_SPELL_ANNAKARL_TELEPORT },
     { "Ghorrock Teleport",     GUI_SPELL_GHORROCK_TELEPORT },
 };
 #define GUI_SPELL_GRID_COUNT ((int)(sizeof(GUI_SPELL_GRID) / sizeof(GUI_SPELL_GRID[0])))
@@ -3369,37 +3106,25 @@ static inline int gui_spell_castable(GuiSpellIdx s) {
 }
 
 static void gui_draw_spellbook(GuiState* gs, Player* p) {
-    (void)p;
-    int cols = GUI_SPELL_GRID_COLS;
-    int gap, icon_sz, gx, gy;
-    gui_spell_grid_metrics(gs, &gx, &gy, &icon_sz, &gap);
+    int gx, gy;
+    gui_spell_grid_origin(gs, &gx, &gy);
 
     for (int i = 0; i < GUI_SPELL_GRID_COUNT; i++) {
-        int col = i % cols;
-        int row = i / cols;
-        int ix = gx + col * (icon_sz + gap);
-        int iy = gy + row * (icon_sz + gap);
-
-        GuiSpellIdx sidx_here = GUI_SPELL_GRID[i].idx;
-        int targeting = (gs->pending_spell_highlight >= 0 &&
-                         (int)sidx_here == gs->pending_spell_highlight);
-        Rectangle cell_rect = {(float)ix, (float)iy, (float)icon_sz, (float)icon_sz};
-
-        DrawRectangleRec(cell_rect, (Color){12, 12, 28, 105});
+        int col = i % GUI_SPELL_GRID_COLS;
+        int row = i / GUI_SPELL_GRID_COLS;
+        int ix = gx + col * GUI_SPELL_PITCH_X;
+        int iy = gy + row * GUI_SPELL_PITCH_Y;
 
         GuiSpellIdx sidx = GUI_SPELL_GRID[i].idx;
-        if (gs->sprites_loaded) {
-            int castable = gui_spell_castable(sidx);
-            Texture2D tex = castable ? gs->spell_on[sidx] : gs->spell_off[sidx];
-            if (tex.id != 0) {
-                gui_draw_texture_centered(
-                    tex,
-                    cell_rect,
-                    24,
-                    24,
-                    castable ? WHITE : (Color){170, 170, 170, 220});
-            }
-        }
+        int targeting = (gs->pending_spell_highlight >= 0 &&
+                         (int)sidx == gs->pending_spell_highlight);
+        Rectangle cell_rect = {(float)ix, (float)iy,
+            (float)GUI_SPELL_ICON_PX, (float)GUI_SPELL_ICON_PX};
+
+        int castable = gui_spell_castable(sidx);
+        Texture2D tex = castable ? gs->spell_on[sidx] : gs->spell_off[sidx];
+        Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
+        DrawTexturePro(tex, src, cell_rect, (Vector2){0, 0}, 0.0f, WHITE);
         if (targeting) {
             DrawRectangleLinesEx(cell_rect, 2.0f, YELLOW);
         }
@@ -3550,19 +3275,15 @@ static void gui_draw_stats(GuiState* gs, Player* p) {
         (int)(total.y + 5), 10, GUI_TEXT_YELLOW);
 }
 
-
 static void gui_cycle_entity(GuiState* gs) {
     if (gs->gui_entity_count <= 0) return;
     gs->gui_entity_idx = (gs->gui_entity_idx + 1) % gs->gui_entity_count;
 }
 
-/* Draw the resizable-mode side panel: minimap area at top (handled outside),
-   then top tab row, content area, and bottom tab row at the very bottom. */
 static void gui_draw(GuiState* gs, Player* p) {
     int content_y = gs->panel_y + gs->status_bar_h + gs->tab_h;
     gui_draw_tab_bar(gs);
 
-    /* entity selector header */
     if (gs->gui_entity_count > 1) {
         int hx = gs->panel_x + GUI_SIDE_CONTENT_X + 4;
         int hy = content_y + 2;
@@ -3572,7 +3293,6 @@ static void gui_draw(GuiState* gs, Player* p) {
                         hx, hy, 8, GUI_TEXT_ORANGE);
     }
 
-    /* active tab content */
     switch (gs->active_tab) {
         case GUI_TAB_COMBAT:    gui_draw_combat(gs, p);    break;
         case GUI_TAB_INVENTORY: gui_draw_inventory(gs, p); break;
@@ -3580,9 +3300,9 @@ static void gui_draw(GuiState* gs, Player* p) {
         case GUI_TAB_PRAYER:    gui_draw_prayer(gs, p);    break;
         case GUI_TAB_SPELLBOOK: gui_draw_spellbook(gs, p); break;
         case GUI_TAB_STATS:     gui_draw_stats(gs, p);     break;
-        case GUI_TAB_QUESTS:    /* empty tab */ break;
+        case GUI_TAB_QUESTS:     break;
         default: break;
     }
 }
 
-#endif /* OSRS_GUI_H */
+#endif

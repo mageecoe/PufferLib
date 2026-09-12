@@ -1,4 +1,8 @@
 #line 2424 "encounter_inferno.h"
+static inline int inf_jad_attack_timer(int wave) {
+    return wave == 67 ? 9 : 8;
+}
+
 static AttackStyle inf_player_equipped_attack_style(const InfernoState* s) {
     uint8_t weapon = s->player.equipped[GEAR_SLOT_WEAPON];
     AttackStyle style = (AttackStyle)get_item_attack_style(weapon);
@@ -12,10 +16,26 @@ static AttackStyle inf_player_equipped_attack_style(const InfernoState* s) {
 
 static void inf_refresh_human_loadout_stats(InfernoState* s) {
     AttackStyle style = inf_player_equipped_attack_style(s);
-    int spell_base_damage = (style == ATTACK_STYLE_MAGIC) ? 30 : 0;
+    int spell_base_damage = (style == ATTACK_STYLE_MAGIC)
+        ? inf_player_magic_base_damage(&s->player) : 0;
     encounter_compute_player_equipped_stats(
         &s->player, style, s->player.fight_style, spell_base_damage,
         &s->human_loadout_stats);
+}
+
+static FightStyle inf_live_fight_style_for(AttackStyle style) {
+    if (style == ATTACK_STYLE_MAGIC) return FIGHT_STYLE_AUTOCAST;
+    if (style == ATTACK_STYLE_RANGED) return FIGHT_STYLE_RAPID;
+    return FIGHT_STYLE_ACCURATE;
+}
+
+static void inf_refresh_live_stats(InfernoState* s) {
+    AttackStyle style = inf_player_equipped_attack_style(s);
+    int spell_base_damage = (style == ATTACK_STYLE_MAGIC)
+        ? inf_player_magic_base_damage(&s->player) : 0;
+    encounter_compute_player_equipped_stats(
+        &s->player, style, inf_live_fight_style_for(style), spell_base_damage,
+        &s->live_stats);
 }
 
 static const EncounterLoadoutStats* inf_current_loadout_stats(
@@ -26,18 +46,14 @@ static const EncounterLoadoutStats* inf_current_loadout_stats(
         inf_refresh_human_loadout_stats(s);
         return &s->human_loadout_stats;
     }
-    return &s->loadout_stats[s->weapon_set];
+    return &s->live_stats;
 }
 
 static int inf_player_weapon_is(const InfernoState* s, uint8_t item) {
     return s->player.equipped[GEAR_SLOT_WEAPON] == item;
 }
 
-static void inf_damage_player_from_type(
-    InfernoState* s,
-    int source_type,
-    int damage
-);
+static void inf_damage_player(InfernoState* s, int damage);
 
 typedef struct {
     EncounterLoadoutStats stats;
@@ -45,10 +61,6 @@ typedef struct {
     int is_barrage;
     uint8_t weapon;
 } InfPlayerAttack;
-
-static int inf_is_barrage_spell(int spell) {
-    return spell == ENCOUNTER_SPELL_BLOOD || spell == ENCOUNTER_SPELL_ICE;
-}
 
 static int inf_spell_magic_level_requirement(int spell) {
     if (spell == ENCOUNTER_SPELL_ICE) return ICE_BARRAGE_LEVEL;
@@ -61,20 +73,6 @@ static int inf_spell_action_to_spell(int action_spell) {
     if (action_spell == 1) return ENCOUNTER_SPELL_BLOOD;
     if (action_spell == 2) return ENCOUNTER_SPELL_ICE;
     return ENCOUNTER_SPELL_NONE;
-}
-
-static int inf_spell_base_damage(int spell) {
-    if (!inf_is_barrage_spell(spell)) {
-        fprintf(stderr, "BUG: invalid Inferno spell %d\n", spell);
-        abort();
-    }
-    return 30;
-}
-
-static int inf_player_autocast_spell(const Player* p) {
-    return p->autocast_spell == ENCOUNTER_SPELL_ICE
-        ? ENCOUNTER_SPELL_ICE
-        : ENCOUNTER_SPELL_BLOOD;
 }
 
 static FightStyle inf_player_spell_fight_style(const Player* p) {
@@ -99,8 +97,7 @@ static void inf_compute_manual_spell_stats(
         inf_player_spell_fight_style(&s->player),
         inf_spell_base_damage(spell),
         out);
-    out->attack_speed = 5;
-    out->attack_range = 10;
+    inf_apply_spell_cast_stats(out);
 }
 
 static int inf_resolve_player_attack_ctx(
@@ -137,19 +134,10 @@ static int inf_resolve_player_attack_ctx(
 
     out->spell = autocast_spell;
     out->is_barrage = 1;
-    out->stats.attack_speed = 5;
-    out->stats.attack_range = 10;
+    inf_apply_spell_cast_stats(&out->stats);
     return 1;
 }
 
-static int inf_resolve_player_attack(
-    InfernoState* s,
-    int manual_spell,
-    InfPlayerAttack* out
-) {
-    return inf_resolve_player_attack_ctx(
-        s, inf_legacy_context(), manual_spell, out);
-}
 
 static int inf_player_has_any_barrage_spell_available(const InfernoState* s) {
     return s->player.current_magic >= BLOOD_BARRAGE_LEVEL;
@@ -212,8 +200,9 @@ static int inf_is_untagged_live_zuk_healer_slot(
     return aggro->active && aggro->type == INF_NPC_ZUK;
 }
 
-static int inf_player_can_attack_npc_from_current_tile(
+static int inf_player_can_attack_npc_from_current_tile_ctx(
     const InfernoState* s,
+    const InfernoContext* ctx,
     int npc_idx
 ) {
     if (npc_idx < 0 || npc_idx >= INF_MAX_NPCS) return 0;
@@ -221,17 +210,22 @@ static int inf_player_can_attack_npc_from_current_tile(
     const InfNPC* npc = &s->npcs[npc_idx];
     if (!npc->active || npc->death_ticks != 0 || npc->hp <= 0) return 0;
 
-    const EncounterLoadoutStats* ls = &s->loadout_stats[s->weapon_set];
-    return encounter_player_can_attack(
+    const EncounterLoadoutStats* ls = &s->live_stats;
+    return inf_los_clear_ctx(
+        s,
+        ctx,
         s->player.x,
         s->player.y,
+        1,
         npc->x,
         npc->y,
         npc->size,
-        ls->attack_range,
-        s->los_blockers,
-        s->los_blocker_count);
+        ls->attack_range);
 }
+
+
+
+
 
 static int inf_player_can_phantom_barrage_npc(
     InfernoState* s,
@@ -247,6 +241,7 @@ static int inf_player_can_phantom_barrage_npc(
 
     if (!inf_player_has_any_barrage_spell_available(s)) return 0;
 
+    OsrsLosQuery los_query = inf_player_los_query(s);
     return encounter_player_can_attack(
         s->player.x,
         s->player.y,
@@ -254,8 +249,10 @@ static int inf_player_can_phantom_barrage_npc(
         npc->y,
         npc->size,
         10,
-        s->los_blockers,
-        s->los_blocker_count);
+        ctx->collision_map,
+        ctx->world_offset_x,
+        ctx->world_offset_y,
+        &los_query);
 }
 
 static int inf_npc_is_phantom_barrage_obs_candidate(
@@ -284,11 +281,10 @@ static int inf_untagged_zuk_healer_target_is_safe_now(
     const InfernoContext* ctx,
     int npc_idx
 ) {
-    (void)ctx;
     if (!inf_is_untagged_live_zuk_healer_slot(s, npc_idx)) return 1;
     return inf_player_behind_zuk_shield_now(s) &&
         s->player.attack_timer == 0 &&
-        inf_player_can_attack_npc_from_current_tile(s, npc_idx);
+        inf_player_can_attack_npc_from_current_tile_ctx(s, ctx, npc_idx);
 }
 
 static int inf_is_safe_untagged_zuk_healer_target_now(
@@ -338,7 +334,7 @@ static void inf_apply_npc_target_damage(InfernoState* s, int target_idx, int dam
     encounter_damage_npc(&target->hp, &target->hit_landed_this_tick,
                          &target->hit_damage, damage);
     if (target->type == INF_NPC_ZUK_SHIELD)
-        s->shield_damage_this_tick += (float)(target_hp_before - target->hp);
+        s->tick_scratch.shield_damage += (float)(target_hp_before - target->hp);
 
     if (target->hp <= 0 && target->type == INF_NPC_ZUK_SHIELD) {
         inf_deactivate_npc(s, target_idx);
@@ -394,61 +390,43 @@ static int inf_apply_elysian_to_player_hit(InfernoState* s, int damage, int* red
     return damage * 75 / 100;
 }
 
-static int inf_npc_footprint_overlaps_player_3x3(const InfernoState* s, const InfNPC* npc) {
-    int size = inf_npc_effective_size(npc);
-    int min_x = s->player.x - 1;
-    int max_x = s->player.x + 1;
-    int min_y = s->player.y - 1;
-    int max_y = s->player.y + 1;
-    return npc->x <= max_x &&
-        npc->x + size - 1 >= min_x &&
-        npc->y <= max_y &&
-        npc->y + size - 1 >= min_y;
-}
-
-static void inf_apply_echo_boots_recoil(InfernoState* s, int final_damage) {
+static void inf_apply_echo_boots_recoil(InfernoState* s, int attacker_slot, int final_damage) {
     osrs_ensure_player_equipment(&s->player);
     int recoil_damage = osrs_echo_boots_recoil_damage(
         &s->player.equipment_effect_profile,
         &s->player.item_effect_state,
         final_damage);
     if (recoil_damage <= 0) return;
+    if (attacker_slot < 0 || attacker_slot >= INF_MAX_NPCS) return;
+
+    InfNPC* npc = &s->npcs[attacker_slot];
+    if (!npc->active || npc->death_ticks > 0 || npc->hp <= 0) return;
+    if (npc->type == INF_NPC_ZUK || npc->type == INF_NPC_ZUK_SHIELD) return;
 
     osrs_consume_echo_boots_charge(&s->player);
-    for (int i = 0; i < INF_MAX_NPCS; i++) {
-        InfNPC* npc = &s->npcs[i];
-        if (!npc->active || npc->death_ticks > 0 || npc->hp <= 0)
-            continue;
-        if (npc->type == INF_NPC_ZUK || npc->type == INF_NPC_ZUK_SHIELD)
-            continue;
-        if (!inf_npc_footprint_overlaps_player_3x3(s, npc))
-            continue;
+    int applied = encounter_damage_npc(
+        &npc->hp, &npc->hit_landed_this_tick, &npc->hit_damage,
+        recoil_damage);
+    if (applied <= 0) return;
 
-        int applied = encounter_damage_npc(
-            &npc->hp, &npc->hit_landed_this_tick, &npc->hit_damage,
-            recoil_damage);
-        if (applied <= 0) continue;
+    s->tick_scratch.damage_dealt += (float)applied;
+    if (npc->type == INF_NPC_HEALER_ZUK) {
+        s->tick_scratch.damage_zuk_healers += (float)applied;
+    } else if (npc->type == INF_NPC_HEALER_JAD) {
+        s->tick_scratch.damage_jad_healers += (float)applied;
+    } else if (npc->type == INF_NPC_JAD) {
+        s->tick_scratch.damage_jad += (float)applied;
+    } else {
+        s->tick_scratch.damage_set += (float)applied;
+    }
 
-        s->damage_dealt_this_tick += (float)applied;
-        if (npc->type == INF_NPC_HEALER_ZUK) {
-            s->damage_zuk_healers_this_tick += (float)applied;
-        } else if (npc->type == INF_NPC_HEALER_JAD) {
-            s->damage_jad_healers_this_tick += (float)applied;
-        } else if (npc->type == INF_NPC_JAD) {
-            s->damage_jad_this_tick += (float)applied;
-        } else {
-            s->damage_set_this_tick += (float)applied;
-        }
-
-        if (npc->hp <= 0) {
-            if (npc->type == INF_NPC_JAD) s->kill_jad_this_tick++;
-            else if (npc->type == INF_NPC_HEALER_ZUK) s->kill_zuk_healer_this_tick++;
-            else if (npc->type != INF_NPC_HEALER_JAD) s->kill_set_this_tick++;
-            inf_apply_npc_death(s, i);
-        }
+    if (npc->hp <= 0) {
+        if (npc->type == INF_NPC_JAD) s->tick_scratch.kill_jad++;
+        else if (npc->type == INF_NPC_HEALER_ZUK) s->tick_scratch.kill_zuk_healer++;
+        else if (npc->type != INF_NPC_HEALER_JAD) s->tick_scratch.kill_set++;
+        inf_apply_npc_death(s, attacker_slot);
     }
 }
-
 
 static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
     InfNPC* npc = &s->npcs[idx];
@@ -461,7 +439,8 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
 
     int has_los_now = 0;
     if (stats->attack_range > 1) {
-        has_los_now = inf_npc_has_los(s, idx);
+        inf_sample_npc_player_los_frame(s, ctx, idx);
+        has_los_now = inf_npc_has_los_ctx(s, ctx, idx);
     }
 
     if (npc->type == INF_NPC_BLOB &&
@@ -469,7 +448,6 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
         has_los_now &&
         !npc->had_los_last_tick) {
         npc->blob_scanned_prayer = (int)s->player.prayer;
-        /* commit to opposite of scanned prayer; random if scanned prayer is neither */
         if (s->player.prayer == PRAYER_PROTECT_MAGIC) npc->attack_style = ATTACK_STYLE_RANGED;
         else if (s->player.prayer == PRAYER_PROTECT_RANGED) npc->attack_style = ATTACK_STYLE_MAGIC;
         else npc->attack_style = (encounter_rand_int(&s->rng_state, 2) == 0) ? ATTACK_STYLE_MAGIC : ATTACK_STYLE_RANGED;
@@ -483,26 +461,20 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
 
     if (npc->attack_timer > 0) return;
 
-    /* shield doesn't attack */
     if (npc->type == INF_NPC_ZUK_SHIELD) return;
 
-    /* nibbler attacks pillars, not player */
     if (npc->type == INF_NPC_NIBBLER) {
         for (int p = 0; p < INF_NUM_PILLARS; p++) {
             if (!s->pillars[p].active) continue;
             int ddx = npc->x - s->pillars[p].x;
             int ddy = npc->y - s->pillars[p].y;
             if (ddx >= -1 && ddx <= INF_PILLAR_SIZE && ddy >= -1 && ddy <= INF_PILLAR_SIZE) {
-                /* nibblers deal 0-4 damage per hit (ref: InfernoTrainer JalNib.ts).
-                   bypasses combat formula — custom weapon directly rolls rand(0..4). */
                 int dmg = encounter_rand_int(&s->rng_state, 5);
                 s->pillars[p].hp -= dmg;
                 if (s->pillars[p].hp <= 0) {
                     s->pillars[p].active = 0;
-                    s->pillar_lost_this_tick = p;
-                    inf_rebuild_los(s);
-                    inf_invalidate_los_cache(s);
-                    /* pillar death AOE: deals damage to all mobs + player within 1 tile */
+                    inf_reset_npc_player_los_frame(ctx);
+                    s->tick_scratch.pillar_lost = p;
                     for (int n = 0; n < INF_MAX_NPCS; n++) {
                         if (!s->npcs[n].active) continue;
                         int ndx = s->npcs[n].x - s->pillars[p].x;
@@ -512,13 +484,11 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
                             inf_apply_npc_death(s, n);
                         }
                     }
-                    /* also damages the player if standing next to the pillar */
                     {
                         int pdx = s->player.x - s->pillars[p].x;
                         int pdy = s->player.y - s->pillars[p].y;
                         if (pdx >= -1 && pdx <= INF_PILLAR_SIZE && pdy >= -1 && pdy <= INF_PILLAR_SIZE) {
-                            /* pillar collapse: 49 damage (observed in-game, server-side formula unknown) */
-                            inf_damage_player_from_type(s, -1, 49);
+                            inf_damage_player(s, 49);
                         }
                     }
                 }
@@ -530,21 +500,18 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
         return;
     }
 
-    /* zuk healer: heal Zuk while it is untapped, switch to player-facing
-       sparks after tag. */
     if (npc->type == INF_NPC_HEALER_ZUK) {
+        InfHealerState* h = inf_npc_healer(npc);
         if (npc->aggro_target >= 0) {
-            /* heal Zuk with a 3-tick projectile */
             int ti = npc->aggro_target;
             if (ti >= 0 && ti < INF_MAX_NPCS && s->npcs[ti].active && s->npcs[ti].type == INF_NPC_ZUK) {
-                npc->heal_target = ti;
-                npc->heal_timer = 3;
+                h->target = ti;
+                h->timer = 3;
                 npc->attack_visual_target = ti;
             }
         } else {
-            /* tagged healer: stop healing and fire the 3-spark ground pattern. */
-            npc->heal_target = -1;
-            npc->heal_timer = 0;
+            h->target = -1;
+            h->timer = 0;
             npc->attack_visual_target = -1;
             inf_queue_zuk_healer_sparks(s, npc);
         }
@@ -554,42 +521,38 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
         return;
     }
 
-    /* jad healer: heals its Jad while aggro_target points at the boss, then
-       switches to crush melee after a player tag. */
     if (npc->type == INF_NPC_HEALER_JAD) {
-        int jad_idx = npc->jad_owner_idx;
+        InfHealerState* h = inf_npc_healer(npc);
+        int jad_idx = h->owner_idx;
         if (npc->aggro_target >= 0) {
             if (jad_idx >= 0 && s->npcs[jad_idx].active &&
                 s->npcs[jad_idx].type == INF_NPC_JAD) {
-                /* heal Jad with the reference 3-tick delay. */
-                npc->heal_target = jad_idx;
-                npc->heal_timer = 3;
+                h->target = jad_idx;
+                h->timer = 3;
                 npc->attack_visual_target = jad_idx;
             }
             npc->attacked_this_tick = 1;
             npc->attack_timer = stats->attack_speed;
             return;
         }
-        /* if player has tagged this healer, it only attacks on cardinal melee
-           contact. diagonal corners do not count. */
-        if (entity_has_line_of_sight(
-                s->los_blockers, s->los_blocker_count,
+        if (inf_los_clear_ctx(
+                s, ctx,
                 npc->x, npc->y, 1,
                 s->player.x, s->player.y, 1,
                 1)) {
             int max_hit = osrs_npc_melee_max_hit(stats->str_level, stats->melee_str_bonus);
-            int dmg = encounter_rand_int(&s->rng_state, max_hit + 1);
-            /* accuracy roll */
             int att_roll = osrs_npc_attack_roll(stats->att_level, stats->melee_att_bonus);
             const EncounterLoadoutStats* ls = inf_current_loadout_stats(s, ctx);
-            int def_bonus = ls->def_crush;
-            int def_roll = osrs_player_def_roll_vs_npc(s->player.current_defence, s->player.current_magic, def_bonus, ATTACK_STYLE_MELEE);
-            if (encounter_rand_float(&s->rng_state) >= osrs_hit_chance(att_roll, def_roll)) dmg = 0;
+            int def_roll = encounter_player_def_roll_from_loadout(
+                s->player.current_defence, s->player.current_magic,
+                ls->def_stab, ls->def_slash, ls->def_crush, ls->def_magic, ls->def_ranged,
+                ATTACK_STYLE_MELEE, MELEE_STYLE_CRUSH);
+            int dmg = encounter_npc_roll_attack(att_roll, def_roll, max_hit, &s->rng_state);
             int prayer_matches = (s->player.prayer == PRAYER_PROTECT_MELEE);
-              if (prayer_matches) { dmg = 0; s->prayer_correct_this_tick = 1; }
-              else if (dmg > 0) { s->off_prayer_hits_this_tick++; }
-            inf_apply_echo_boots_recoil(s, dmg);
-            inf_damage_player_from_type(s, npc->type, dmg);
+              if (prayer_matches) { dmg = 0; s->tick_scratch.prayer_correct = 1; }
+              else if (dmg > 0) { s->tick_scratch.off_prayer_hits++; }
+            inf_apply_echo_boots_recoil(s, idx, dmg);
+            inf_damage_player(s, dmg);
             npc->attack_style_this_tick = ATTACK_STYLE_MELEE;
             npc->attacked_this_tick = 1;
             npc->attack_visual_target = -1;
@@ -601,9 +564,9 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
     if (npc->aggro_target >= 0 && npc->aggro_target < INF_MAX_NPCS) {
         InfNPC* target = &s->npcs[npc->aggro_target];
         if (target->active) {
-            int actual_style = npc->attack_style;
+            AttackStyle actual_style = npc->attack_style;
             if (npc->type == INF_NPC_JAD) {
-                actual_style = npc->jad_attack_style;
+                actual_style = inf_npc_jad(npc)->attack_style;
                 if (actual_style == ATTACK_STYLE_NONE)
                     actual_style = inf_jad_roll_primary_style(&s->rng_state);
             }
@@ -621,63 +584,48 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
             npc->attack_visual_target = npc->aggro_target;
             npc->attack_timer = stats->attack_speed;
             if (npc->type == INF_NPC_JAD) {
-                npc->jad_attack_style = ATTACK_STYLE_NONE;
-                if (s->wave == 66)      npc->attack_timer = 8;
-                else if (s->wave == 67) npc->attack_timer = 9;
-                else                    npc->attack_timer = 8;
+                inf_npc_jad(npc)->attack_style = ATTACK_STYLE_NONE;
+                npc->attack_timer = inf_jad_attack_timer(s->wave);
             }
             return;
         }
         npc->aggro_target = -1;
     }
 
-    /* ranged/magic NPCs need LOS, except blobs once they have already stored
-       a prayer scan. ref: InfernoTrainer JalAk.ts attackIfPossible(). */
     if (stats->attack_range > 1 &&
         !(npc->type == INF_NPC_BLOB && npc->blob_scanned_prayer >= 0) &&
         !has_los_now) return;
 
-    /* compute distance to player */
     int dist = encounter_dist_to_npc(s->player.x, s->player.y,
                                       npc->x, npc->y, npc->size);
     if (dist == 0 || dist > stats->attack_range) return;
+    if (stats->attack_range == 1 &&
+            !inf_npc_melee_contact_allows_attack_at_tile(
+                s->player.x, s->player.y, npc->type,
+                npc->x, npc->y, npc->size, dist))
+        return;
 
-    /* blob prayer reading: 2-phase attack with attack_speed = 3.
-       scan tick: read player prayer, set timer, return (shows scan animation).
-       fire tick: determine style from scanned prayer, fall through to common attack.
-       total cycle = 6 ticks (3 scan + 3 cooldown).
-       ref: InfernoTrainer JalAk.ts attackIfPossible() */
     if (npc->type == INF_NPC_BLOB) {
         if (npc->blob_scanned_prayer < 0) {
-            /* no pending scan → start scan phase: read prayer, commit to opposite style */
             npc->blob_scanned_prayer = (int)s->player.prayer;
             if (s->player.prayer == PRAYER_PROTECT_MAGIC) npc->attack_style = ATTACK_STYLE_RANGED;
             else if (s->player.prayer == PRAYER_PROTECT_RANGED) npc->attack_style = ATTACK_STYLE_MAGIC;
             else npc->attack_style = (encounter_rand_int(&s->rng_state, 2) == 0) ? ATTACK_STYLE_MAGIC : ATTACK_STYLE_RANGED;
-            npc->attacked_this_tick = 1;  /* triggers scan animation */
-            npc->attack_timer = stats->attack_speed;  /* 3 */
+            npc->attacked_this_tick = 1;
+            npc->attack_timer = stats->attack_speed;
             return;
         }
-        /* has pending scan → determine style and fall through to fire */
         npc->blob_scanned_prayer = -1;
-        /* fall through to common attack code */
     }
 
-    /* determine actual attack style */
-    int actual_style = npc->attack_style;
+    AttackStyle actual_style = npc->attack_style;
 
-    /* jad: use the committed preview style if present. if the preview was not
-       seeded, fall back to the 50/50 primary-style roll. */
     if (npc->type == INF_NPC_JAD) {
-        actual_style = npc->jad_attack_style;
+        actual_style = inf_npc_jad(npc)->attack_style;
         if (actual_style == ATTACK_STYLE_NONE)
             actual_style = inf_jad_roll_primary_style(&s->rng_state);
     }
 
-    /* zuk: typeless attack (not blockable by prayer).
-       InfernoTrainer TzKalZuk.ts: Zuk always fires at the shield if the player is
-       behind it (shield absorbs, 0 damage). otherwise fires at the player.
-       hit delay = 4 ticks (ZukWeapon: setDelay=4). */
     if (npc->type == INF_NPC_ZUK) {
         int si = s->zuk.shield_idx;
         int player_behind_shield = 0;
@@ -689,32 +637,28 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
         }
 
         if (player_behind_shield) {
-            /* shield absorbs — Zuk fires at shield, 0 damage */
             npc->attacked_this_tick = 1;
             npc->attack_style_this_tick = ATTACK_STYLE_MAGIC;
             npc->attack_visual_target = si;
         } else {
-            /* typeless hit on player — not blockable by prayer, no accuracy roll.
-               rolled 0..max_hit, queued at T and lands at T+4 unchanged. */
             int max_hit = osrs_npc_magic_max_hit(stats->magic_base_dmg, stats->magic_dmg_pct);
             int dmg = encounter_rand_int(&s->rng_state, max_hit + 1);
-            if (s->player_pending_hit_count < ENCOUNTER_MAX_PENDING_HITS) {
-                EncounterPendingHit* ph = &s->player_pending_hits[s->player_pending_hit_count++];
-                ph->active = 1;
-                ph->damage = dmg;
-                ph->ticks_remaining = 4;
-                ph->attack_style = ATTACK_STYLE_NONE;  /* typeless — not blockable */
-                ph->check_prayer = 0;
-                ph->prayer_check_delay = 0;
-                ph->spell_type = 0;
-                ph->source_npc_type = npc->type;
-                ph->hit_success = 1;
-                ph->elysian_reduced = 0;
-            }
+            EncounterProjectileTiming zuk_timing =
+                inf_npc_projectile_timing(npc->type, ATTACK_STYLE_MAGIC, dist);
+            inf_queue_player_pending_hit(s, idx, npc->type, (EncounterPendingHit){
+                .ticks_remaining = (int8_t)zuk_timing.damage_delay_ticks,
+                .attack_style = ATTACK_STYLE_NONE,
+                .check_prayer = 0,
+                .prayer_check_delay = 0,
+                .spell_type = 0,
+                .source_npc_type = (int8_t)npc->type,
+                .hit_success = 1,
+                .elysian_reduced = 0,
+                .damage = (int16_t)dmg,
+            });
             s->last_hit_by_type = INF_NPC_ZUK;
             npc->attacked_this_tick = 1;
             npc->attack_style_this_tick = ATTACK_STYLE_MAGIC;
-            /* attack_visual_target = -1 (player), already default */
         }
         npc->attack_timer = s->zuk.enraged ? 7 : stats->attack_speed;
         return;
@@ -736,7 +680,6 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
         return;
     }
 
-    /* max hit from stats + bonuses via OSRS combat formulas */
     int max_hit = osrs_npc_max_hit(actual_style,
         stats->str_level, stats->range_level,
         stats->melee_str_bonus, stats->ranged_str_bonus,
@@ -748,7 +691,6 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
     int dmg = is_delayed_jad ? max_hit : encounter_rand_int(&s->rng_state, max_hit + 1);
     int accuracy_hit = 1;
 
-    /* accuracy roll: NPC attack roll vs player defence roll */
     if (!is_delayed_jad) {
         int att_lvl, att_bonus;
         if (actual_style == ATTACK_STYLE_MELEE) {
@@ -760,12 +702,12 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
         }
         int att_roll = osrs_npc_attack_roll(att_lvl, att_bonus);
         const EncounterLoadoutStats* ls = inf_current_loadout_stats(s, ctx);
-        int def_bonus = encounter_player_def_bonus(
+        int def_roll = encounter_player_def_roll_from_loadout(
+            s->player.current_defence, s->player.current_magic,
             ls->def_stab, ls->def_slash, ls->def_crush, ls->def_magic, ls->def_ranged,
             actual_style, stats->melee_style);
-        int def_roll = osrs_player_def_roll_vs_npc(s->player.current_defence, s->player.current_magic, def_bonus, actual_style);
-        if (encounter_rand_float(&s->rng_state) >= osrs_hit_chance(att_roll, def_roll)) {
-            dmg = 0;  /* missed */
+        if (!encounter_roll_hit_chance(&s->rng_state, att_roll, def_roll)) {
+            dmg = 0;
             accuracy_hit = 0;
         }
     }
@@ -776,85 +718,87 @@ static void inf_npc_attack_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
     if (is_delayed_jad)
         hit_delay += INF_JAD_PROJECTILE_DELAY;
 
-    /* track which styles fired this tick for multi-style analysis */
-    if (actual_style == ATTACK_STYLE_MELEE) s->tick_styles_fired |= 1;
-    else if (actual_style == ATTACK_STYLE_RANGED) s->tick_styles_fired |= 2;
-    else if (actual_style == ATTACK_STYLE_MAGIC) s->tick_styles_fired |= 4;
-    s->tick_attacks_fired++;
+    if (actual_style == ATTACK_STYLE_MELEE) s->tick_scratch.styles_fired |= 1;
+    else if (actual_style == ATTACK_STYLE_RANGED) s->tick_scratch.styles_fired |= 2;
+    else if (actual_style == ATTACK_STYLE_MAGIC) s->tick_scratch.styles_fired |= 4;
+    s->tick_scratch.attacks_fired++;
     s->attacks_by_type[npc->type]++;
 
-    /* bat (JalMejRah): drain 3 run energy (300 internal) on every attack.
-       ref: OSRS wiki Jal-MejRah, InfernoTrainer JalMejRah.ts */
     if (npc->type == INF_NPC_BAT) {
         s->player.run_energy -= 300;
         if (s->player.run_energy < 0) s->player.run_energy = 0;
     }
 
     if (hit_delay == 0) {
-        /* melee: instant damage, check prayer now */
         int prayer_matches = encounter_prayer_correct_for_style(s->player.prayer, actual_style);
-          if (prayer_matches) { dmg = 0; s->prayer_correct_this_tick++; s->prayer_correct_by_type[npc->type]++; }
-          else if (dmg > 0) { s->off_prayer_hits_this_tick++; }
+        if (prayer_matches) {
+            dmg = 0;
+            s->tick_scratch.prayer_correct++;
+            s->prayer_correct_by_type[npc->type]++;
+        } else if (dmg > 0) {
+            s->tick_scratch.off_prayer_hits++;
+        }
         int elysian_reduced = 0;
         dmg = inf_apply_elysian_to_player_hit(s, dmg, &elysian_reduced);
         if (elysian_reduced) s->player.elysian_proc_this_tick = 1;
-        inf_apply_echo_boots_recoil(s, dmg);
+        inf_apply_echo_boots_recoil(s, idx, dmg);
         s->dmg_from_type[npc->type] += (float)dmg;
         if (dmg > 0) s->last_hit_by_type = npc->type;
-        inf_damage_player_from_type(s, npc->type, dmg);
+        inf_damage_player(s, dmg);
     } else {
-            /* ranged/magic: queue pending hit on player */
-        if (s->player_pending_hit_count < ENCOUNTER_MAX_PENDING_HITS) {
-            int is_jad = (npc->type == INF_NPC_JAD);
-            if (!is_jad) {
-                int prayer_matches = encounter_prayer_correct_for_style(s->player.prayer, actual_style);
-          if (prayer_matches) { dmg = 0; s->prayer_correct_this_tick++; s->prayer_correct_by_type[npc->type]++; }
-          else if (dmg > 0) { s->off_prayer_hits_this_tick++; }
+        int is_jad = (npc->type == INF_NPC_JAD);
+        if (!is_jad) {
+            EncounterProtectResolve pr =
+                encounter_resolve_protect_at_throw(dmg, s->player.prayer, actual_style);
+            dmg = pr.frozen_damage;
+            if (pr.prayed) {
+                s->tick_scratch.prayer_correct++;
+                s->prayer_correct_by_type[npc->type]++;
+            } else if (dmg > 0) {
+                s->tick_scratch.off_prayer_hits++;
             }
-            if (!is_delayed_jad) {
-                s->dmg_from_type[npc->type] += (float)dmg;
-                if (dmg > 0) s->last_hit_by_type = npc->type;
-            }
-            /* bat stat drain: 50% chance on successful hit when not praying protect
-               from missiles, drain all combat stats by 1. ref: OSRS wiki Jal-MejRah */
-            if (npc->type == INF_NPC_BAT && dmg > 0 &&
-                encounter_rand_int(&s->rng_state, 2) == 0) {
-                if (s->player.current_attack > 0) s->player.current_attack--;
-                if (s->player.current_strength > 0) s->player.current_strength--;
-                if (s->player.current_defence > 0) s->player.current_defence--;
-                if (s->player.current_ranged > 0) s->player.current_ranged--;
-                if (s->player.current_magic > 0) s->player.current_magic--;
-            }
-            EncounterPendingHit* ph = &s->player_pending_hits[s->player_pending_hit_count++];
-            ph->active = 1;
-            ph->damage = dmg;
-            ph->ticks_remaining = hit_delay;
-            ph->attack_style = actual_style;
-            ph->check_prayer = is_jad ? 1 : 0;
-            ph->prayer_check_delay = is_jad ? INF_JAD_PROJECTILE_DELAY + 1 : 0;
-            ph->spell_type = 0;
-            ph->source_npc_type = npc->type;
-            ph->hit_success = accuracy_hit;
-            ph->elysian_reduced = 0;
         }
+        if (!is_delayed_jad) {
+            s->dmg_from_type[npc->type] += (float)dmg;
+            if (dmg > 0) s->last_hit_by_type = npc->type;
+        }
+        if (npc->type == INF_NPC_BAT && dmg > 0 &&
+            encounter_rand_int(&s->rng_state, 2) == 0) {
+            if (s->player.current_attack > 0) s->player.current_attack--;
+            if (s->player.current_strength > 0) s->player.current_strength--;
+            if (s->player.current_defence > 0) s->player.current_defence--;
+            if (s->player.current_ranged > 0) s->player.current_ranged--;
+            if (s->player.current_magic > 0) s->player.current_magic--;
+        }
+        EncounterPendingHit hit;
+        if (is_jad) {
+            hit = (EncounterPendingHit){
+                .ticks_remaining = (int8_t)hit_delay,
+                .attack_style = (int8_t)actual_style,
+                .check_prayer = 1,
+                .prayer_check_delay = INF_JAD_PROJECTILE_DELAY + 1,
+                .spell_type = ENCOUNTER_SPELL_NONE,
+                .source_npc_type = (int8_t)npc->type,
+                .hit_success = (int8_t)accuracy_hit,
+                .elysian_reduced = 0,
+                .damage = (int16_t)dmg,
+            };
+        } else {
+            hit = encounter_pending_hit_resolved_at_throw(
+                dmg, hit_delay, actual_style, s->player.prayer,
+                npc->type, 0 , accuracy_hit, NULL);
+        }
+        inf_queue_player_pending_hit(s, idx, npc->type, hit);
     }
 
     npc->attacked_this_tick = 1;
     npc->attack_style_this_tick = actual_style;
     if (npc->type == INF_NPC_JAD)
-        npc->jad_attack_style = ATTACK_STYLE_NONE;
+        inf_npc_jad(npc)->attack_style = ATTACK_STYLE_NONE;
     npc->attack_timer = stats->attack_speed;
 
-    /* jad attack speed varies by wave */
-    if (npc->type == INF_NPC_JAD) {
-        if (s->wave == 66)      npc->attack_timer = 8;  /* wave 67 */
-        else if (s->wave == 67) npc->attack_timer = 9;  /* wave 68 */
-        else                    npc->attack_timer = 8;  /* zuk wave */
-    }
-}
-
-static void inf_npc_attack(InfernoState* s, int idx) {
-    inf_npc_attack_ctx(s, inf_legacy_context(), idx);
+    if (npc->type == INF_NPC_JAD)
+        npc->attack_timer = inf_jad_attack_timer(s->wave);
 }
 
 
@@ -879,19 +823,15 @@ static int inf_find_mager_respawn_tile(
     return !inf_npc_blocked(&mc, *out_x, *out_y, size);
 }
 
-/* mager resurrection is only evaluated on a real magic attack opportunity,
-   not every NPC tick. */
 static int inf_mager_resurrect_ctx(InfernoState* s, InfernoContext* ctx, int idx) {
     InfNPC* npc = &s->npcs[idx];
     if (npc->type != INF_NPC_MAGER || !npc->active) return 0;
-    if (s->wave >= 68) return 0;  /* no resurrection during Zuk wave */
+    if (s->wave >= 68) return 0;
     if (npc->resurrect_cooldown > 0) return 0;
     if (s->dead_mob_count == 0) return 0;
 
-    /* 10% chance when the mager converts a ready magic attack into a respawn. */
     if (encounter_rand_int(&s->rng_state, 10) != 0) return 0;
 
-    /* pick a random dead mob */
     int di = encounter_rand_int(&s->rng_state, s->dead_mob_count);
     InfDeadMob* dm = &s->dead_mobs[di];
 
@@ -904,25 +844,19 @@ static int inf_mager_resurrect_ctx(InfernoState* s, InfernoContext* ctx, int idx
         return 0;
 
     inf_init_npc(s, slot, dm->type, rx, ry);
-    s->npcs[slot].hp = dm->hp;      /* 50% of max HP */
+    s->npcs[slot].hp = dm->hp;
     s->npcs[slot].max_hp = dm->max_hp;
     s->npcs[slot].resurrection_count = 1;
     s->npcs[slot].attack_timer = INF_NPC_STATS[dm->type].attack_speed;
 
-    /* remove from dead store (swap with last) */
     s->dead_mobs[di] = s->dead_mobs[s->dead_mob_count - 1];
     s->dead_mob_count--;
 
-    /* 8-tick cooldown */
     npc->resurrect_cooldown = 8;
     npc->resurrecting_this_tick = 1;
     npc->resurrection_visual_target = slot;
     npc->attack_visual_target = slot;
     return 1;
-}
-
-static int inf_mager_resurrect(InfernoState* s, int idx) {
-    return inf_mager_resurrect_ctx(s, inf_legacy_context(), idx);
 }
 
 
@@ -952,7 +886,7 @@ static int inf_try_sample_jad_healer_spawn(
         int hy = jad->y + offsets[order[i]][1];
         if (encounter_entity_footprints_overlap(hx, hy, 1, jad->x, jad->y, jad->size))
             continue;
-        if (inf_npc_terrain_blocked_ctx(s, ctx, hx, hy, 1))
+        if (inf_npc_environment_blocked_ctx(s, ctx, hx, hy, 1))
             continue;
         *out_x = hx;
         *out_y = hy;
@@ -984,16 +918,12 @@ static void inf_sample_jad_healer_spawn(
 static void inf_jad_check_healers_ctx(InfernoState* s, const InfernoContext* ctx, int idx) {
     InfNPC* npc = &s->npcs[idx];
     if (npc->type != INF_NPC_JAD || !npc->active) return;
-    if (npc->jad_healer_spawned) return;
+    if (inf_npc_jad(npc)->healer_spawned) return;
 
-    /* spawn healers when below 50% HP */
-    if (npc->hp > npc->max_hp / 2) return;
-    npc->jad_healer_spawned = 1;
+    if (npc->hp >= npc->max_hp / 2) return;
+    inf_npc_jad(npc)->healer_spawned = 1;
 
-    int num_healers;
-    if (s->wave == 66)      num_healers = 5;  /* wave 67: 5 healers */
-    else if (s->wave == 67) num_healers = 3;  /* wave 68: 3 per jad */
-    else                    num_healers = 3;  /* zuk wave: 3 */
+    int num_healers = s->wave == 66 ? 5 : 3;
 
     for (int h = 0; h < num_healers; h++) {
         int slot = inf_find_free_npc(s);
@@ -1002,72 +932,57 @@ static void inf_jad_check_healers_ctx(InfernoState* s, const InfernoContext* ctx
         int hy = npc->y;
         inf_sample_jad_healer_spawn(s, ctx, npc, &hx, &hy);
         inf_init_npc(s, slot, INF_NPC_HEALER_JAD, hx, hy);
-        s->npcs[slot].jad_owner_idx = idx;
+        inf_npc_healer(&s->npcs[slot])->owner_idx = idx;
         s->npcs[slot].aggro_target = idx;
     }
-}
-
-static void inf_jad_check_healers(InfernoState* s, int idx) {
-    inf_jad_check_healers_ctx(s, inf_legacy_context(), idx);
 }
 
 
 static void inf_zuk_tick(InfernoState* s) {
     if (!inf_is_final_wave(s)) return;
 
-    /* find zuk NPC */
     int zuk_idx = inf_find_live_zuk_idx(s);
     if (zuk_idx < 0) return;
     InfNPC* zuk = &s->npcs[zuk_idx];
 
-    /* shield oscillation */
     int si = s->zuk.shield_idx;
     if (si >= 0 && s->npcs[si].active) {
         InfNPC* shield = &s->npcs[si];
         if (s->zuk.shield_freeze > 0) {
             s->zuk.shield_freeze--;
         } else {
-            int ox = shield->x;
-            int oy = shield->y;
+            int old_x = shield->x;
+            int old_y = shield->y;
             if (inf_npc_sets_collision_flag(shield->type))
-                inf_unstamp_npc_collision_footprint(s, ox, oy, shield->size);
+                inf_unstamp_npc_collision_footprint(
+                    s, old_x, old_y, shield->size);
             shield->x += s->zuk.shield_dir;
-            /* boundary check: 5-tick freeze at edges */
             if (shield->x < 11) {
-                shield->x = 11;
-                s->zuk.shield_freeze = 5;
+                s->zuk.shield_freeze = 4;
                 s->zuk.shield_dir = 1;
             } else if (shield->x > 35) {
-                shield->x = 35;
-                s->zuk.shield_freeze = 5;
+                s->zuk.shield_freeze = 4;
                 s->zuk.shield_dir = -1;
             }
             if (inf_npc_sets_collision_flag(shield->type))
-                inf_stamp_npc_collision_footprint(s, shield->x, shield->y, shield->size);
+                inf_stamp_npc_collision_footprint(
+                    s, shield->x, shield->y, shield->size);
         }
     }
 
-    /* set timer pause: freeze at HP < 600, resume at HP < 480 with +175 ticks */
     if (!s->zuk.has_paused && zuk->hp < 600) {
         s->zuk.timer_paused = 1;
         s->zuk.has_paused = 1;
     }
 
-    /* jad spawn at HP < 480 (with shield alive, timer paused) */
     if (!s->zuk.jad_spawned && s->zuk.timer_paused && zuk->hp < 480 &&
         si >= 0 && s->npcs[si].active) {
         s->zuk.jad_spawned = 1;
         s->zuk.timer_paused = 0;
         s->zuk.set_timer += 175;
-        int j_slot = inf_find_free_npc(s);
-        if (j_slot >= 0) {
-            inf_init_npc(s, j_slot, INF_NPC_JAD, 24, 32);
-            s->npcs[j_slot].aggro_target = si;  /* target shield */
-            s->npcs[j_slot].stun_timer = 7;     /* spawn delay */
-        }
+        inf_spawn_zuk_jad(s, si);
     }
 
-    /* set timer: spawns JalZek + JalXil targeting the shield */
     if (!s->zuk.timer_paused) {
         if (s->zuk.set_timer > 0)
             s->zuk.set_timer--;
@@ -1076,36 +991,24 @@ static void inf_zuk_tick(InfernoState* s) {
             if (m_slot >= 0) {
                 inf_init_npc(s, m_slot, INF_NPC_MAGER, 20, 36);
                 if (si >= 0) s->npcs[m_slot].aggro_target = si;
-                s->npcs[m_slot].stun_timer = 7;  /* spawn delay */
+                s->npcs[m_slot].stun_timer = 7;
             }
             int r_slot = inf_find_free_npc(s);
             if (r_slot >= 0) {
                 inf_init_npc(s, r_slot, INF_NPC_RANGER, 29, 36);
                 if (si >= 0) s->npcs[r_slot].aggro_target = si;
-                s->npcs[r_slot].stun_timer = 9;  /* spawn delay */
+                s->npcs[r_slot].stun_timer = 9;
             }
             s->zuk.set_timer = s->zuk.set_interval;
         }
     }
 
-    /* healer spawn at HP < 240: 4 JalMejJak targeting Zuk, sets enraged */
     if (!s->zuk.healer_spawned && zuk->hp < 240) {
         s->zuk.healer_spawned = 1;
         s->zuk.enraged = 1;
-        static const int healer_pos[4][2] = {
-            {16, 48}, {20, 48}, {30, 48}, {34, 48}
-        };
-        for (int h = 0; h < 4; h++) {
-            int slot = inf_find_free_npc(s);
-            if (slot >= 0) {
-                inf_init_npc(s, slot, INF_NPC_HEALER_ZUK,
-                             healer_pos[h][0], healer_pos[h][1]);
-                s->npcs[slot].aggro_target = zuk_idx;  /* heal Zuk until tagged */
-            }
-        }
+        inf_spawn_zuk_healers(s, zuk_idx);
     }
 
-    /* on zuk death: all other mobs die */
     if (zuk->hp <= 0) {
         for (int i = 0; i < INF_MAX_NPCS; i++) {
             inf_deactivate_npc(s, i);
@@ -1115,10 +1018,11 @@ static void inf_zuk_tick(InfernoState* s) {
 
 static void inf_healer_apply_landed_heal(InfernoState* s, int idx) {
     InfNPC* npc = &s->npcs[idx];
-    int target_idx = npc->heal_target;
+    InfHealerState* h = inf_npc_healer(npc);
+    int target_idx = h->target;
     int heal_cap = (npc->type == INF_NPC_HEALER_ZUK) ? 25 : 20;
 
-    npc->heal_target = -1;
+    h->target = -1;
     if (target_idx < 0 || target_idx >= INF_MAX_NPCS) return;
     if (!s->npcs[target_idx].active) return;
 
@@ -1128,69 +1032,18 @@ static void inf_healer_apply_landed_heal(InfernoState* s, int idx) {
     if (s->npcs[target_idx].hp > s->npcs[target_idx].max_hp)
         s->npcs[target_idx].hp = s->npcs[target_idx].max_hp;
     float effective_heal = (float)(s->npcs[target_idx].hp - before);
-    s->hp_restored_this_tick += effective_heal;
+    s->tick_scratch.hp_restored += effective_heal;
     if (s->npcs[target_idx].type == INF_NPC_JAD)
-        s->hp_restored_jad_this_tick += effective_heal;
+        s->tick_scratch.hp_restored_jad += effective_heal;
     if (s->npcs[target_idx].type == INF_NPC_ZUK)
-        s->hp_restored_zuk_this_tick += effective_heal;
-}
-
-static void inf_record_redemption_pressure(
-    InfernoState* s,
-    int source_type,
-    int damage
-) {
-    if (s->player.current_prayer <= 0) return;
-
-    int before_hp = s->player.current_hitpoints;
-    int after_hp = before_hp - (damage > 0 ? damage : 0);
-    if (after_hp < 0) after_hp = 0;
-
-    int before_band = before_hp > 0 && before_hp <= 9;
-    int after_band = after_hp > 0 && after_hp <= 9;
-    int source_valid = source_type >= 0 && source_type < INF_NUM_NPC_TYPES;
-    int after_240 = s->tick_at_le_240 >= 0;
-
-    if (before_band || after_band) {
-        int heal = s->player.base_prayer / 4;
-        int missing = s->player.base_hitpoints - after_hp;
-        float heal_potential = (float)(missing > heal ? heal : missing);
-        if (heal_potential < 0.0f) heal_potential = 0.0f;
-
-        s->redemption_proc_opportunities++;
-        s->redemption_heal_potential += heal_potential;
-        if (damage <= 0)
-            s->redemption_zero_hit_proc_opportunities++;
-        if (after_240) {
-            s->redemption_proc_opportunities_after_240++;
-            s->redemption_heal_potential_after_240 += heal_potential;
-        }
-        if (source_valid) {
-            s->redemption_proc_opportunities_by_type[source_type]++;
-            s->redemption_heal_potential_by_type[source_type] += heal_potential;
-            if (damage <= 0)
-                s->redemption_zero_hit_proc_opportunities_by_type[source_type]++;
-        }
-    }
-
-    if (damage > 0 && before_hp > 0 && after_hp <= 0) {
-        if (before_band) {
-            s->redemption_deaths_from_band++;
-            if (after_240)
-                s->redemption_deaths_from_band_after_240++;
-            if (source_valid)
-                s->redemption_deaths_from_band_by_type[source_type]++;
-        } else {
-            s->redemption_deaths_from_above_band++;
-        }
-    }
+        s->tick_scratch.hp_restored_zuk += effective_heal;
 }
 
 static int inf_redemption_threshold(const InfernoState* s) {
     return (s->player.base_hitpoints - 1) / 10;
 }
 
-static void inf_apply_redemption_if_due(InfernoState* s, int before_hp, int damage) {
+static void inf_apply_redemption_if_due(InfernoState* s, int before_hp) {
     Player* p = &s->player;
     if (p->prayer != PRAYER_REDEMPTION || p->current_prayer <= 0)
         return;
@@ -1204,15 +1057,10 @@ static void inf_apply_redemption_if_due(InfernoState* s, int before_hp, int dama
         return;
 
     int old_offensive = p->offensive_prayer;
-    int hp_before_heal = p->current_hitpoints;
     int heal = p->base_prayer / 4;
     p->current_hitpoints += heal;
     if (p->current_hitpoints > p->base_hitpoints)
         p->current_hitpoints = p->base_hitpoints;
-    s->redemption_proc_count++;
-    if (damage <= 0)
-        s->redemption_zero_hit_proc_count++;
-    s->redemption_heal_done += (float)(p->current_hitpoints - hp_before_heal);
     p->current_prayer = 0;
     p->prayer = PRAYER_NONE;
     p->offensive_prayer = OFFENSIVE_PRAYER_NONE;
@@ -1223,15 +1071,10 @@ static void inf_apply_redemption_if_due(InfernoState* s, int before_hp, int dama
         encounter_recompute_loadout_max_hits(s->loadout_stats, INF_NUM_WEAPON_SETS, p);
 }
 
-static void inf_damage_player_from_type(
-    InfernoState* s,
-    int source_type,
-    int damage
-) {
+static void inf_damage_player(InfernoState* s, int damage) {
     int before_hp = s->player.current_hitpoints;
-    inf_record_redemption_pressure(s, source_type, damage);
-    encounter_damage_player(&s->player, damage, &s->damage_received_this_tick);
-    inf_apply_redemption_if_due(s, before_hp, damage);
+    encounter_damage_player(&s->player, damage, &s->tick_scratch.damage_received);
+    inf_apply_redemption_if_due(s, before_hp);
 }
 
 static void inf_queue_pending_spark(
@@ -1259,21 +1102,21 @@ static void inf_queue_zuk_healer_sparks(InfernoState* s, const InfNPC* npc) {
     if (clamped_x < npc->x - 5) clamped_x = npc->x - 5;
     if (clamped_x > npc->x + 4) clamped_x = npc->x + 4;
 
-    /* InfernoTrainer JalMejJak AoeWeapon: 2 random sparks target y=14+rand(0..3)
-       in reference coords. our coord system is Y-flipped (ours_y = 57 - ref_y),
-       so ref y=14..17 maps to ours y=40..43 (near player/zuk band). */
+    int direct_damage = 5 + encounter_rand_int(&s->rng_state, 6);
     inf_queue_pending_spark(s, npc->x, npc->y, clamped_x, s->player.y,
-                            5 + encounter_rand_int(&s->rng_state, 6), 4);
-    inf_queue_pending_spark(s,
-                            npc->x, npc->y,
-                            npc->x + encounter_rand_int(&s->rng_state, 11) - 5,
-                            40 + encounter_rand_int(&s->rng_state, 4),
-                            5 + encounter_rand_int(&s->rng_state, 6), 4);
-    inf_queue_pending_spark(s,
-                            npc->x, npc->y,
-                            npc->x + encounter_rand_int(&s->rng_state, 11) - 5,
-                            40 + encounter_rand_int(&s->rng_state, 4),
-                            5 + encounter_rand_int(&s->rng_state, 6), 4);
+                            direct_damage, 3);
+
+    int spark1_x = npc->x + encounter_rand_int(&s->rng_state, 11) - 5;
+    int spark1_y = 40 + encounter_rand_int(&s->rng_state, 4);
+    int spark1_damage = 5 + encounter_rand_int(&s->rng_state, 6);
+    inf_queue_pending_spark(s, npc->x, npc->y, spark1_x, spark1_y,
+                            spark1_damage, 3);
+
+    int spark2_x = npc->x + encounter_rand_int(&s->rng_state, 11) - 5;
+    int spark2_y = 40 + encounter_rand_int(&s->rng_state, 4);
+    int spark2_damage = 5 + encounter_rand_int(&s->rng_state, 6);
+    inf_queue_pending_spark(s, npc->x, npc->y, spark2_x, spark2_y,
+                            spark2_damage, 3);
 }
 
 static void inf_resolve_pending_sparks(InfernoState* s) {
@@ -1285,19 +1128,15 @@ static void inf_resolve_pending_sparks(InfernoState* s) {
         if (encounter_entity_footprints_overlap(
                 s->pending_sparks[i].x - 1, s->pending_sparks[i].y - 1, 3,
                 s->player.x, s->player.y, 1)) {
-            inf_damage_player_from_type(
-                s, INF_NPC_HEALER_ZUK, s->pending_sparks[i].damage);
-            s->spark_damage_this_tick += (float)s->pending_sparks[i].damage;
+            inf_damage_player(s, s->pending_sparks[i].damage);
+            s->tick_scratch.spark_damage += (float)s->pending_sparks[i].damage;
             s->last_hit_by_type = INF_NPC_HEALER_ZUK;
         }
         s->pending_sparks[i].active = 0;
     }
 }
 
-
 static void inf_tick_npcs_ctx(InfernoState* s, InfernoContext* ctx) {
-    /* NPC per-tick flags are cleared in inf_step BEFORE inf_tick_player,
-       so player hit flags survive through both tick functions into render_post_tick. */
 
     inf_resolve_npc_target_hits(s);
     inf_zuk_tick(s);
@@ -1311,10 +1150,13 @@ static void inf_tick_npcs_ctx(InfernoState* s, InfernoContext* ctx) {
         if (!s->npcs[i].active) continue;
 
         if ((s->npcs[i].type == INF_NPC_HEALER_JAD || s->npcs[i].type == INF_NPC_HEALER_ZUK) &&
-            s->npcs[i].death_ticks == 0 && s->npcs[i].heal_timer > 0) {
-            s->npcs[i].heal_timer--;
-            if (s->npcs[i].heal_timer == 0)
-                inf_healer_apply_landed_heal(s, i);
+            s->npcs[i].death_ticks == 0) {
+            InfHealerState* h = inf_npc_healer(&s->npcs[i]);
+            if (h->timer > 0) {
+                h->timer--;
+                if (h->timer == 0)
+                    inf_healer_apply_landed_heal(s, i);
+            }
         }
 
         if (s->npcs[i].death_ticks > 0) {
@@ -1336,14 +1178,12 @@ static void inf_tick_npcs_ctx(InfernoState* s, InfernoContext* ctx) {
         if (s->npcs[i].type == INF_NPC_MAGER && s->npcs[i].resurrect_cooldown > 0)
             s->npcs[i].resurrect_cooldown--;
 
-        /* meleer dig check */
         if (s->npcs[i].type == INF_NPC_MELEER)
             inf_meleer_dig_check_ctx(s, ctx, i);
 
         inf_npc_move_ctx(s, ctx, i);
         inf_npc_attack_ctx(s, ctx, i);
 
-        /* jad healer spawning */
         if (s->npcs[i].type == INF_NPC_JAD)
             inf_jad_check_healers_ctx(s, ctx, i);
     }
@@ -1370,8 +1210,4 @@ static void inf_tick_npcs_ctx(InfernoState* s, InfernoContext* ctx) {
             s->npcs[slot].attack_timer = 4;
         }
     }
-}
-
-static void inf_tick_npcs(InfernoState* s) {
-    inf_tick_npcs_ctx(s, inf_legacy_context());
 }

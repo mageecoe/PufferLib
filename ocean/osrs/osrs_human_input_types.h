@@ -1,10 +1,3 @@
-/**
- * @file osrs_pvp_human_input_types.h
- * @brief HumanInput struct and CursorMode enum — separated from human_input.h
- *        to break circular include dependency (gui.h needs HumanInput, but
- *        human_input.h needs gui.h for prayer/spell grid constants).
- */
-
 #ifndef OSRS_HUMAN_INPUT_TYPES_H
 #define OSRS_HUMAN_INPUT_TYPES_H
 
@@ -17,7 +10,7 @@
 typedef enum {
     CURSOR_NORMAL = 0,
     CURSOR_ITEM_TARGET,
-    CURSOR_SPELL_TARGET,   /* clicked a combat spell, waiting for target click */
+    CURSOR_SPELL_TARGET,
 } CursorMode;
 
 typedef enum {
@@ -36,6 +29,7 @@ typedef enum {
     HUMAN_COMMAND_ITEM_ON_ITEM,
     HUMAN_COMMAND_ITEM_ON_WIDGET,
     HUMAN_COMMAND_SPELL_ON_WIDGET,
+    HUMAN_COMMAND_INVENTORY_PRIMARY_CLICK,
 } HumanCommandKind;
 
 typedef struct {
@@ -66,36 +60,36 @@ typedef struct {
 } HumanCommandQueue;
 
 typedef struct HumanInput {
-    int enabled;                /* H key toggle: 1 = human controls active */
+    int enabled;
 
     HumanCommandQueue commands;
 
-    /* semantic action staging (set by clicks, consumed at tick boundary) */
-    int pending_move_x, pending_move_y;   /* world tile coords, -1 = none */
-    int pending_attack;                    /* 1 = attack target entity */
-    int pending_prayer;                    /* ENCOUNTER_OVERHEAD_* value, -1 = no change */
-    int pending_offensive_prayer;          /* ENCOUNTER_OFFENSIVE_* value, -1 = no change */
-    int pending_food;                      /* 1 = eat food */
-    int pending_karambwan;                 /* 1 = eat karambwan */
-    int pending_potion;                    /* PotionAction-style intent, 0 = none */
-    int pending_veng;                      /* 1 = cast vengeance */
-    int pending_spec;                      /* 1 = use special attack */
-    int pending_spell;                     /* 0=none, ATTACK_ICE or ATTACK_BLOOD */
-    int pending_target_idx;                /* NPC entity index to attack, -1 = none */
-    int pending_gear;                      /* gear switch action value, 0 = none */
+    int pending_move_x, pending_move_y;
+    int pending_attack;
+    int pending_prayer;
+    int pending_offensive_prayer;
+    int pending_food;
+    int pending_karambwan;
+    int pending_potion;
+    int pending_veng;
+    int pending_spec;
+    int pending_spell;
+    int pending_target_idx;
+    int pending_gear;
+    int pending_modifier_select;
+    int pending_grapple_slot;
 
     CursorMode cursor_mode;
-    int selected_item_inventory_slot;       /* inventory slot selected with Use. -1 = none */
-    int selected_item_db_idx;               /* ITEM_DATABASE index for selected item */
-    int selected_item_osrs_id;              /* OSRS item id for selected item source */
-    int selected_spell;                    /* ATTACK_ICE or ATTACK_BLOOD for targeting */
-    int selected_spell_gui_idx;            /* GuiSpellIdx of the exact spell cell clicked, for UI highlight. -1 = none */
+    int selected_item_inventory_slot;
+    int selected_item_db_idx;
+    int selected_item_osrs_id;
+    int selected_spell;
+    int selected_spell_gui_idx;
 
-    /* visual feedback: click cross at screen-space position (like real OSRS client) */
-    int click_screen_x, click_screen_y;    /* screen pixel where click occurred */
-    int click_cross_timer;                 /* counts up from 0, animation progresses over time */
-    int click_cross_active;                /* 1 = cross is visible */
-    int click_is_attack;                   /* 1 = red cross (attack), 0 = yellow cross (move) */
+    int click_screen_x, click_screen_y;
+    int click_cross_timer;
+    int click_cross_active;
+    int click_is_attack;
 } HumanInput;
 
 static inline void human_command_queue_reserve(HumanCommandQueue* q, int min_capacity) {
@@ -154,6 +148,8 @@ static inline void human_input_clear_pending(HumanInput* hi) {
     hi->pending_spell = 0;
     hi->pending_target_idx = -1;
     hi->pending_gear = 0;
+    hi->pending_modifier_select = 0;
+    hi->pending_grapple_slot = 0;
     human_input_clear_commands(hi);
 }
 
@@ -207,10 +203,11 @@ static inline void human_input_queue_offensive_prayer(HumanInput* hi, int offens
     });
 }
 
-static inline void human_input_queue_eat(HumanInput* hi, int food) {
+static inline void human_input_queue_eat(HumanInput* hi, int food, int inventory_slot) {
     human_input_queue_command(hi, (HumanCommand){
         .kind = HUMAN_COMMAND_EAT,
         .food = food,
+        .inventory_slot = inventory_slot,
     });
 }
 
@@ -297,6 +294,16 @@ static inline void human_input_queue_equip_inventory_item(
     });
 }
 
+static inline void human_input_queue_inventory_primary_click(
+    HumanInput* hi,
+    int inventory_slot
+) {
+    human_input_queue_command(hi, (HumanCommand){
+        .kind = HUMAN_COMMAND_INVENTORY_PRIMARY_CLICK,
+        .inventory_slot = inventory_slot,
+    });
+}
+
 static inline void human_input_queue_fight_style(HumanInput* hi, int fight_style) {
     human_input_queue_command(hi, (HumanCommand){
         .kind = HUMAN_COMMAND_FIGHT_STYLE,
@@ -380,4 +387,4 @@ static inline void human_input_apply_ui_intent(HumanInput* hi, OsrsUiIntent inte
     }
 }
 
-#endif /* OSRS_HUMAN_INPUT_TYPES_H */
+#endif

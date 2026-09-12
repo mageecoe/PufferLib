@@ -1,16 +1,3 @@
-/**
- * @fileoverview Loads terrain mesh from .terrain binary into raylib Model.
- *
- * Binary format:
- *   magic: uint32 "TERR" (0x54455252)
- *   vertex_count: uint32
- *   region_count: uint32
- *   min_world_x: int32
- *   min_world_y: int32
- *   vertices: float32[vertex_count * 3]
- *   colors: uint8[vertex_count * 4]
- */
-
 #ifndef OSRS_TERRAIN_H
 #define OSRS_TERRAIN_H
 
@@ -24,6 +11,17 @@
 
 #define TERR_MAGIC 0x54455252
 
+typedef enum {
+    TERRAIN_SELECTION_ALL,
+    TERRAIN_SELECTION_REGION,
+} TerrainSelectionKind;
+
+typedef struct {
+    TerrainSelectionKind kind;
+    int region_x;
+    int region_y;
+} TerrainSelection;
+
 typedef struct {
     Model model;
     int vertex_count;
@@ -31,7 +29,6 @@ typedef struct {
     int min_world_x;
     int min_world_y;
     int loaded;
-    /* heightmap for ground-level queries */
     float* heightmap;
     int hm_min_x;
     int hm_min_y;
@@ -39,7 +36,10 @@ typedef struct {
     int hm_height;
 } TerrainMesh;
 
-static TerrainMesh* terrain_load(const char* path) {
+static TerrainMesh* terrain_load_selected(
+    const char* path,
+    TerrainSelection selection
+) {
     FILE* f = osrs_asset_fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "terrain_load: could not open %s\n", path);
@@ -61,24 +61,64 @@ static TerrainMesh* terrain_load(const char* path) {
     fprintf(stderr, "terrain_load: %u verts, %u regions, origin (%d, %d)\n",
             vert_count, region_count, min_wx, min_wy);
 
-    /* read vertices */
     float* raw_verts = (float*)osrs_malloc_or_abort(
         vert_count * 3 * sizeof(float), "terrain vertices");
     osrs_read_exact(f, raw_verts, sizeof(float), vert_count * 3, path, "vertices");
 
-    /* read colors */
     unsigned char* raw_colors = (unsigned char*)osrs_malloc_or_abort(
         vert_count * 4, "terrain colors");
     osrs_read_exact(f, raw_colors, 1, vert_count * 4, path, "colors");
+    if (vert_count % 3 != 0) {
+        fprintf(stderr, "terrain_load: vertex count is not divisible by three\n");
+        abort();
+    }
 
-    /* build raylib mesh */
+    if (selection.kind == TERRAIN_SELECTION_REGION) {
+        uint32_t selected_vert_count = 0;
+        for (uint32_t source_vertex = 0;
+                source_vertex < vert_count;
+                source_vertex += 3) {
+            float* triangle = raw_verts + source_vertex * 3;
+            float centroid_x =
+                (triangle[0] + triangle[3] + triangle[6]) / 3.0f;
+            float centroid_y =
+                -(triangle[2] + triangle[5] + triangle[8]) / 3.0f;
+            int region_x = (int)floorf(centroid_x / 64.0f);
+            int region_y = (int)floorf(centroid_y / 64.0f);
+            if (region_x != selection.region_x ||
+                    region_y != selection.region_y) {
+                continue;
+            }
+
+            if (selected_vert_count != source_vertex) {
+                memcpy(
+                    raw_verts + selected_vert_count * 3,
+                    triangle,
+                    9 * sizeof(float));
+                memcpy(
+                    raw_colors + selected_vert_count * 4,
+                    raw_colors + source_vertex * 4,
+                    12);
+            }
+            selected_vert_count += 3;
+        }
+        if (selected_vert_count == 0) {
+            fprintf(stderr, "terrain_load: region (%d, %d) is empty\n",
+                selection.region_x, selection.region_y);
+            abort();
+        }
+        vert_count = selected_vert_count;
+        region_count = 1;
+        fprintf(stderr, "terrain region: (%d, %d), %u verts\n",
+            selection.region_x, selection.region_y, vert_count);
+    }
+
     Mesh mesh = { 0 };
     mesh.vertexCount = (int)vert_count;
     mesh.triangleCount = (int)(vert_count / 3);
     mesh.vertices = raw_verts;
     mesh.colors = raw_colors;
 
-    /* compute normals for proper lighting */
     mesh.normals = (float*)osrs_calloc_or_abort(
         vert_count * 3, sizeof(float), "terrain normals");
     for (int i = 0; i < mesh.triangleCount; i++) {
@@ -113,7 +153,6 @@ static TerrainMesh* terrain_load(const char* path) {
     tm->min_world_y = min_wy;
     tm->loaded = 1;
 
-    /* read heightmap (appended after colors in the binary) */
     int32_t hm_min_x, hm_min_y;
     uint32_t hm_w, hm_h;
     size_t has_heightmap = fread(&hm_min_x, 4, 1, f);
@@ -145,16 +184,34 @@ static TerrainMesh* terrain_load(const char* path) {
     return tm;
 }
 
-/* shift terrain so world coordinates (wx, wy) become local (0, 0).
-   offsets all mesh vertices and heightmap origin. must call before rendering. */
+static TerrainMesh* terrain_load(const char* path) {
+    return terrain_load_selected(
+        path,
+        (TerrainSelection){ .kind = TERRAIN_SELECTION_ALL });
+}
+
+static TerrainMesh* terrain_load_region(
+    const char* path,
+    int region_x,
+    int region_y
+) {
+    return terrain_load_selected(
+        path,
+        (TerrainSelection){
+            .kind = TERRAIN_SELECTION_REGION,
+            .region_x = region_x,
+            .region_y = region_y,
+        });
+}
+
 static void terrain_offset(TerrainMesh* tm, int wx, int wy) {
     if (!tm || !tm->loaded) return;
     float dx = (float)wx;
-    float dz = (float)wy;  /* Z = -world_y in our coord system */
+    float dz = (float)wy;
     float* verts = tm->model.meshes[0].vertices;
     for (int i = 0; i < tm->vertex_count; i++) {
-        verts[i * 3 + 0] -= dx;        /* X */
-        verts[i * 3 + 2] += dz;        /* Z (negated world Y) */
+        verts[i * 3 + 0] -= dx;
+        verts[i * 3 + 2] += dz;
     }
     UpdateMeshBuffer(tm->model.meshes[0], 0, verts,
                      tm->vertex_count * 3 * sizeof(float), 0);
@@ -168,7 +225,6 @@ static void terrain_offset(TerrainMesh* tm, int wx, int wy) {
             wx, wy, tm->min_world_x, tm->min_world_y);
 }
 
-/* query terrain height at a world tile position (tile corner) */
 static float terrain_height_at(TerrainMesh* tm, int world_x, int world_y) {
     if (!tm || !tm->heightmap) return -2.0f;
     int lx = world_x - tm->hm_min_x;
@@ -178,10 +234,6 @@ static float terrain_height_at(TerrainMesh* tm, int world_x, int world_y) {
     return tm->heightmap[lx + ly * tm->hm_width];
 }
 
-/**
- * Average height of a tile's 4 corners. matches how OSRS places players
- * on sloped terrain (average of SW, SE, NW, NE corner heights).
- */
 static float terrain_height_avg(TerrainMesh* tm, int world_x, int world_y) {
     float h00 = terrain_height_at(tm, world_x, world_y);
     float h10 = terrain_height_at(tm, world_x + 1, world_y);
@@ -199,4 +251,4 @@ static void terrain_free(TerrainMesh* tm) {
     free(tm);
 }
 
-#endif /* OSRS_TERRAIN_H */
+#endif

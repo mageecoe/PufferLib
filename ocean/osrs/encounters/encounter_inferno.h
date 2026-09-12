@@ -1,18 +1,3 @@
-/**
- * @file encounter_inferno.h
- * @brief The Inferno — 69-wave PvM challenge with prayer switching and pillar safespotting.
- *
- * core mechanic: 3 destructible pillars block NPC projectiles. the player must
- * position behind pillars to limit incoming attacks to one prayer style at a time.
- * nibblers eat pillars, meleer can dig through them. losing all pillars = death spiral.
- *
- * monster types: nibbler (pillar eater), bat (short-range ranger), blob (prayer reader,
- * splits into 3 on death), meleer (burrows to player), ranger, mager (resurrects dead mobs),
- * jad (random 50/50 range/mage), zuk (final boss with shield mechanic).
- *
- * reference: InfernoTrainer TypeScript, runelite inferno plugin
- */
-
 #ifndef ENCOUNTER_INFERNO_H
 #define ENCOUNTER_INFERNO_H
 
@@ -27,6 +12,10 @@
 #include "../osrs_encounter.h"
 #include "../osrs_encounter_player.h"
 #include "../osrs_encounter_visual_events.h"
+#include "../osrs_player_consumables.h"
+#include "../osrs_inventory_clicks.h"
+#include "../osrs_inventory_actions.h"
+#include "../osrs_policy.h"
 #include "../osrs_interaction.h"
 #include "../data/npc_models.h"
 #include <assert.h>
@@ -37,7 +26,6 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <errno.h>
-
 
 #include "inferno/encounter_inferno_model.inc"
 #include "inferno/encounter_inferno_helpers.inc"
@@ -51,4 +39,4 @@
 #include "inferno/encounter_inferno_obs_mask.inc"
 #include "inferno/encounter_inferno_render_snapshot.inc"
 
-#endif /* ENCOUNTER_INFERNO_H */
+#endif

@@ -1,15 +1,3 @@
-/**
- * @file osrs_pvp_human_input.h
- * @brief Interactive human control for the visual debug viewer.
- *
- * Collects mouse/keyboard input as semantic intents between render frames,
- * then translates them to encounter-specific action arrays at tick boundary.
- * Toggle human control with H key. Works across PvP and encounter modes.
- *
- * Architecture: clicks at 60Hz → HumanInput staging buffer → per-encounter
- * translator at tick rate → int[] action array fed to step().
- */
-
 #ifndef OSRS_HUMAN_INPUT_H
 #define OSRS_HUMAN_INPUT_H
 
@@ -18,11 +6,8 @@
 #include "osrs_human_input_types.h"
 #include "osrs_encounter.h"
 
-/* forward declare — full struct lives in osrs_pvp_render.h */
 struct RenderClient;
 
-
-/** Set click cross at screen position (2D overlay, like real OSRS client). */
 static void human_set_click_cross(HumanInput* hi, int screen_x, int screen_y, int is_attack) {
     hi->click_screen_x = screen_x;
     hi->click_screen_y = screen_y;
@@ -31,13 +16,7 @@ static void human_set_click_cross(HumanInput* hi, int screen_x, int screen_y, in
     hi->click_is_attack = is_attack;
 }
 
-static int human_overhead_click_action(const Player* p, OverheadPrayer target, int set_refresh_action) {
-    return p->prayer == target ? ENCOUNTER_OVERHEAD_OFF : set_refresh_action;
-}
 
-static int human_offensive_click_action(const Player* p, OffensivePrayer target, int set_refresh_action) {
-    return p->offensive_prayer == target ? ENCOUNTER_OFFENSIVE_OFF : set_refresh_action;
-}
 
 static int human_gui_rect_contains(Rectangle rect, int mouse_x, int mouse_y) {
     return mouse_x >= rect.x && mouse_x < rect.x + rect.width &&
@@ -79,68 +58,61 @@ static const char* human_gui_prayer_name(GuiPrayerIdx pidx) {
 }
 
 static int human_apply_prayer_idx(HumanInput* hi, Player* p, GuiPrayerIdx pidx) {
-    switch (pidx) {
-        case GUI_PRAY_PROTECT_MAGIC:
-            hi->pending_prayer = human_overhead_click_action(
-                p, PRAYER_PROTECT_MAGIC, ENCOUNTER_OVERHEAD_SET_REFRESH_MAGIC);
-            human_input_queue_overhead_prayer(hi, hi->pending_prayer);
-            return 1;
-        case GUI_PRAY_PROTECT_MISSILES:
-            hi->pending_prayer = human_overhead_click_action(
-                p, PRAYER_PROTECT_RANGED, ENCOUNTER_OVERHEAD_SET_REFRESH_RANGED);
-            human_input_queue_overhead_prayer(hi, hi->pending_prayer);
-            return 1;
-        case GUI_PRAY_PROTECT_MELEE:
-            hi->pending_prayer = human_overhead_click_action(
-                p, PRAYER_PROTECT_MELEE, ENCOUNTER_OVERHEAD_SET_REFRESH_MELEE);
-            human_input_queue_overhead_prayer(hi, hi->pending_prayer);
-            return 1;
-        case GUI_PRAY_SMITE:
-            hi->pending_prayer = human_overhead_click_action(
-                p, PRAYER_SMITE, ENCOUNTER_OVERHEAD_SET_REFRESH_SMITE);
-            human_input_queue_overhead_prayer(hi, hi->pending_prayer);
-            return 1;
-        case GUI_PRAY_REDEMPTION:
-            hi->pending_prayer = human_overhead_click_action(
-                p, PRAYER_REDEMPTION, ENCOUNTER_OVERHEAD_SET_REFRESH_REDEMPTION);
-            human_input_queue_overhead_prayer(hi, hi->pending_prayer);
-            return 1;
-        case GUI_PRAY_PIETY:
-            hi->pending_offensive_prayer = human_offensive_click_action(
-                p, OFFENSIVE_PRAYER_PIETY, ENCOUNTER_OFFENSIVE_SET_REFRESH_PIETY);
-            human_input_queue_offensive_prayer(hi, hi->pending_offensive_prayer);
-            return 1;
-        case GUI_PRAY_RIGOUR:
-            hi->pending_offensive_prayer = human_offensive_click_action(
-                p, OFFENSIVE_PRAYER_RIGOUR, ENCOUNTER_OFFENSIVE_SET_REFRESH_RIGOUR);
-            human_input_queue_offensive_prayer(hi, hi->pending_offensive_prayer);
-            return 1;
-        case GUI_PRAY_AUGURY:
-            hi->pending_offensive_prayer = human_offensive_click_action(
-                p, OFFENSIVE_PRAYER_AUGURY, ENCOUNTER_OFFENSIVE_SET_REFRESH_AUGURY);
-            human_input_queue_offensive_prayer(hi, hi->pending_offensive_prayer);
-            return 1;
-        default:
-            return 0;
+    static const struct {
+        GuiPrayerIdx idx;
+        OverheadPrayer target;
+        int refresh_action;
+    } overhead_rows[] = {
+        { GUI_PRAY_PROTECT_MAGIC, PRAYER_PROTECT_MAGIC, ENCOUNTER_OVERHEAD_SET_REFRESH_MAGIC },
+        { GUI_PRAY_PROTECT_MISSILES, PRAYER_PROTECT_RANGED, ENCOUNTER_OVERHEAD_SET_REFRESH_RANGED },
+        { GUI_PRAY_PROTECT_MELEE, PRAYER_PROTECT_MELEE, ENCOUNTER_OVERHEAD_SET_REFRESH_MELEE },
+        { GUI_PRAY_SMITE, PRAYER_SMITE, ENCOUNTER_OVERHEAD_SET_REFRESH_SMITE },
+        { GUI_PRAY_REDEMPTION, PRAYER_REDEMPTION, ENCOUNTER_OVERHEAD_SET_REFRESH_REDEMPTION },
+    };
+    static const struct {
+        GuiPrayerIdx idx;
+        OffensivePrayer target;
+        int refresh_action;
+    } offensive_rows[] = {
+        { GUI_PRAY_PIETY, OFFENSIVE_PRAYER_PIETY, ENCOUNTER_OFFENSIVE_SET_REFRESH_PIETY },
+        { GUI_PRAY_RIGOUR, OFFENSIVE_PRAYER_RIGOUR, ENCOUNTER_OFFENSIVE_SET_REFRESH_RIGOUR },
+        { GUI_PRAY_AUGURY, OFFENSIVE_PRAYER_AUGURY, ENCOUNTER_OFFENSIVE_SET_REFRESH_AUGURY },
+    };
+    for (size_t i = 0; i < sizeof(overhead_rows) / sizeof(overhead_rows[0]); i++) {
+        if (overhead_rows[i].idx != pidx) continue;
+        hi->pending_prayer = p->prayer == overhead_rows[i].target
+            ? ENCOUNTER_OVERHEAD_OFF : overhead_rows[i].refresh_action;
+        human_input_queue_overhead_prayer(hi, hi->pending_prayer);
+        return 1;
     }
+    for (size_t i = 0; i < sizeof(offensive_rows) / sizeof(offensive_rows[0]); i++) {
+        if (offensive_rows[i].idx != pidx) continue;
+        hi->pending_offensive_prayer =
+            p->offensive_prayer == offensive_rows[i].target
+                ? ENCOUNTER_OFFENSIVE_OFF : offensive_rows[i].refresh_action;
+        human_input_queue_offensive_prayer(hi, hi->pending_offensive_prayer);
+        return 1;
+    }
+    return 0;
 }
 
 static int human_gui_spell_idx_at(GuiState* gs, int mouse_x, int mouse_y) {
     int cols = GUI_SPELL_GRID_COLS;
-    int gap, icon_sz, gx, gy;
-    gui_spell_grid_metrics(gs, &gx, &gy, &icon_sz, &gap);
+    int gx, gy;
+    gui_spell_grid_origin(gs, &gx, &gy);
 
     if (mouse_x < gx || mouse_y < gy) return -1;
-    int col = (mouse_x - gx) / (icon_sz + gap);
-    int row = (mouse_y - gy) / (icon_sz + gap);
+    int col = (mouse_x - gx) / GUI_SPELL_PITCH_X;
+    int row = (mouse_y - gy) / GUI_SPELL_PITCH_Y;
     if (col < 0 || col >= cols) return -1;
 
     int idx = row * cols + col;
     if (idx < 0 || idx >= GUI_SPELL_GRID_COUNT) return -1;
 
-    int cell_x = gx + col * (icon_sz + gap);
-    int cell_y = gy + row * (icon_sz + gap);
-    if (mouse_x >= cell_x + icon_sz || mouse_y >= cell_y + icon_sz) return -1;
+    int cell_x = gx + col * GUI_SPELL_PITCH_X;
+    int cell_y = gy + row * GUI_SPELL_PITCH_Y;
+    if (mouse_x >= cell_x + GUI_SPELL_ICON_PX || mouse_y >= cell_y + GUI_SPELL_ICON_PX)
+        return -1;
 
     return GUI_SPELL_GRID[idx].idx;
 }
@@ -157,13 +129,13 @@ static int human_select_spell_idx(HumanInput* hi, GuiSpellIdx sidx) {
 
     if (gui_spell_is_ice(sidx)) {
         human_input_apply_ui_intent(
-            hi, osrs_ui_intent_select_spell(ATTACK_ICE, (int)sidx));
+            hi, osrs_ui_intent_select_spell(PVP_ATTACK_ICE, (int)sidx));
         return 1;
     }
 
     if (gui_spell_is_blood(sidx)) {
         human_input_apply_ui_intent(
-            hi, osrs_ui_intent_select_spell(ATTACK_BLOOD, (int)sidx));
+            hi, osrs_ui_intent_select_spell(PVP_ATTACK_BLOOD, (int)sidx));
         return 1;
     }
 
@@ -274,8 +246,6 @@ static void human_apply_spec_toggle(HumanInput* hi) {
     human_input_queue_spec_toggle(hi);
 }
 
-/** Handle prayer icon click. Hit-tests the 5-col prayer grid.
-    Reuses the same layout math as gui_draw_prayer(). */
 static void human_handle_prayer_click(HumanInput* hi, GuiState* gs, Player* p,
                                        int mouse_x, int mouse_y) {
     int idx = human_gui_prayer_idx_at(gs, mouse_x, mouse_y);
@@ -289,7 +259,6 @@ static void human_handle_prayer_click(HumanInput* hi, GuiState* gs, Player* p,
     }
 }
 
-/** Handle spell icon click. Hit-tests the 4-col Ancient spell grid. */
 static void human_handle_spell_click(HumanInput* hi, GuiState* gs,
                                       int mouse_x, int mouse_y) {
     int idx = human_gui_spell_idx_at(gs, mouse_x, mouse_y);
@@ -303,9 +272,6 @@ static void human_handle_spell_click(HumanInput* hi, GuiState* gs,
     }
 }
 
-/** Handle combat panel click (fight style buttons + spec bar).
-    Fight style is set directly on Player (not in the action space).
-    Spec bar click sets pending_spec. */
 static void human_handle_combat_click(HumanInput* hi, GuiState* gs, Player* p,
                                        int mouse_x, int mouse_y) {
     GuiCombatStyleOptions styles = gui_combat_style_options(p->equipped[GEAR_SLOT_WEAPON]);
@@ -359,102 +325,10 @@ static void human_handle_combat_click(HumanInput* hi, GuiState* gs, Player* p,
     }
 }
 
-
-/** Translate human input to PvP 7-head action array for agent 0.
-    Movement is target-relative (ADJACENT/UNDER/DIAGONAL/FARCAST_N). */
-static void human_to_pvp_actions(HumanInput* hi, int* actions,
-                                  Player* agent, Player* target) {
-    /* zero all heads */
-    for (int h = 0; h < NUM_ACTION_HEADS; h++) actions[h] = 0;
-
-    /* HEAD_LOADOUT: keep current gear (human equips items via inventory clicks) */
-    actions[HEAD_LOADOUT] = LOADOUT_KEEP;
-
-    /* HEAD_COMBAT: attack or movement */
-    if (hi->pending_attack) {
-        if (hi->pending_spell == ATTACK_ICE) {
-            actions[HEAD_COMBAT] = ATTACK_ICE;
-        } else if (hi->pending_spell == ATTACK_BLOOD) {
-            actions[HEAD_COMBAT] = ATTACK_BLOOD;
-        } else {
-            actions[HEAD_COMBAT] = ATTACK_ATK;
-        }
-    } else if (hi->pending_move_x >= 0 && hi->pending_move_y >= 0) {
-        /* convert absolute tile to target-relative movement */
-        int dx = hi->pending_move_x - target->x;
-        int dy = hi->pending_move_y - target->y;
-        int dist = (abs(dx) > abs(dy)) ? abs(dx) : abs(dy);  /* chebyshev */
-
-        if (dist == 0) {
-            actions[HEAD_COMBAT] = MOVE_UNDER;
-        } else if (dist == 1) {
-            /* check if cardinal (adjacent) or diagonal */
-            if (dx == 0 || dy == 0) {
-                actions[HEAD_COMBAT] = MOVE_ADJACENT;
-            } else {
-                actions[HEAD_COMBAT] = MOVE_DIAGONAL;
-            }
-        } else {
-            /* farcast: clamp to 2-7 */
-            int fc = dist;
-            if (fc < 2) fc = 2;
-            if (fc > 7) fc = 7;
-            actions[HEAD_COMBAT] = MOVE_FARCAST_2 + (fc - 2);
-        }
-    }
-
-    /* HEAD_OVERHEAD: prayer */
-    if (hi->pending_prayer >= 0) {
-        actions[HEAD_OVERHEAD] = hi->pending_prayer;
-    }
-
-    /* HEAD_FOOD */
-    if (hi->pending_food) {
-        actions[HEAD_FOOD] = FOOD_EAT;
-    }
-
-    /* HEAD_POTION */
-    if (hi->pending_potion > 0) {
-        actions[HEAD_POTION] = hi->pending_potion;
-    }
-
-    /* HEAD_KARAMBWAN */
-    if (hi->pending_karambwan) {
-        actions[HEAD_KARAMBWAN] = KARAM_EAT;
-    }
-
-    /* HEAD_VENG */
-    if (hi->pending_veng) {
-        actions[HEAD_VENG] = VENG_CAST;
-    }
-
-    /* spec: use LOADOUT_SPEC_MELEE/RANGE/MAGIC based on current weapon style */
-    if (hi->pending_spec) {
-        AttackStyle style = (AttackStyle)get_item_attack_style(agent->equipped[GEAR_SLOT_WEAPON]);
-        switch (style) {
-            case ATTACK_STYLE_MELEE:  actions[HEAD_LOADOUT] = LOADOUT_SPEC_MELEE; break;
-            case ATTACK_STYLE_RANGED: actions[HEAD_LOADOUT] = LOADOUT_SPEC_RANGE; break;
-            case ATTACK_STYLE_MAGIC:  actions[HEAD_LOADOUT] = LOADOUT_SPEC_MAGIC; break;
-            default: break;
-        }
-    }
-
-    (void)agent;
-}
-
-/* shared translate helpers (encounter_translate_movement/prayer/target)
-   live in osrs_encounter.h so encounter headers can use them directly. */
-
-
-/* click cross sprite textures: 4 yellow (move) + 4 red (attack) animation frames.
-   loaded from data/sprites/gui/cross_*.png, indexed [0..3] yellow, [4..7] red. */
 #define CLICK_CROSS_NUM_FRAMES 4
-#define CLICK_CROSS_ANIM_TICKS 20  /* total animation duration in client ticks (50Hz) */
+#define CLICK_CROSS_ANIM_TICKS 20
 
-/** Draw click cross at screen-space position using sprite animation.
-    cross_sprites must point to 8 loaded Texture2D (4 yellow + 4 red).
-    Falls back to line drawing if sprites aren't loaded. */
-static void human_draw_click_cross(HumanInput* hi, Texture2D* cross_sprites, int sprites_loaded) {
+static void human_draw_click_cross(HumanInput* hi, Texture2D* cross_sprites) {
     if (!hi->click_cross_active) return;
     if (hi->click_cross_timer >= CLICK_CROSS_ANIM_TICKS) {
         hi->click_cross_active = 0;
@@ -467,23 +341,10 @@ static void human_draw_click_cross(HumanInput* hi, Texture2D* cross_sprites, int
 
     int cx = hi->click_screen_x;
     int cy = hi->click_screen_y;
-
-    if (sprites_loaded && cross_sprites[sprite_idx].id > 0) {
-        Texture2D tex = cross_sprites[sprite_idx];
-        /* center sprite on click position (OSRS draws at mouseX-8, mouseY-8 for 16px) */
-        DrawTexture(tex, cx - tex.width / 2, cy - tex.height / 2, WHITE);
-    } else {
-        float progress = 1.0f - (float)hi->click_cross_timer / CLICK_CROSS_ANIM_TICKS;
-        int alpha = (int)(progress * 255);
-        Color c = hi->click_is_attack
-            ? CLITERAL(Color){ 255, 50, 50, (unsigned char)alpha }
-            : CLITERAL(Color){ 255, 255, 0, (unsigned char)alpha };
-        DrawLine(cx - 6, cy - 6, cx + 6, cy + 6, c);
-        DrawLine(cx + 6, cy - 6, cx - 6, cy + 6, c);
-    }
+    Texture2D tex = cross_sprites[sprite_idx];
+    DrawTexture(tex, cx - tex.width / 2, cy - tex.height / 2, WHITE);
 }
 
-/** Tick the click cross animation timer. Call at 50Hz (client tick rate). */
 static void human_tick_visuals(HumanInput* hi) {
     if (hi->click_cross_active) {
         hi->click_cross_timer++;
@@ -493,4 +354,4 @@ static void human_tick_visuals(HumanInput* hi) {
     }
 }
 
-#endif /* OSRS_HUMAN_INPUT_H */
+#endif

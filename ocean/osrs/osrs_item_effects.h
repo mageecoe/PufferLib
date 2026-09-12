@@ -1,14 +1,7 @@
-/**
- * @fileoverview osrs_item_effects.h — shared passive item effects for current ocean OSRS envs.
- *
- * owns derived equipment effect profiles, mutable passive proc state, and the
- * shared attack/damage/spec-regeneration helpers that consume them. activated
- * weapon specials stay in osrs_special_attacks.h.
- */
-
 #ifndef OSRS_ITEM_EFFECTS_H
 #define OSRS_ITEM_EFFECTS_H
 
+#include <assert.h>
 #include <string.h>
 
 #include "osrs_damage.h"
@@ -21,7 +14,9 @@
 typedef struct {
     int attack_roll;
     int max_hit;
+    int min_hit;
     int use_double_accuracy;
+    int use_fang_accuracy;
 } OsrsPreparedAttackEffects;
 
 typedef struct {
@@ -52,17 +47,6 @@ static inline OsrsTargetEffectContext osrs_target_effect_context_magic(
     };
 }
 
-static inline OsrsTargetEffectContext osrs_target_effect_context_dragon(
-    int magic_level,
-    int magic_attack_bonus
-) {
-    return (OsrsTargetEffectContext){
-        .magic_level = magic_level,
-        .magic_attack_bonus = magic_attack_bonus,
-        .target_class = OSRS_TARGET_CLASS_DRAGON,
-    };
-}
-
 static inline int osrs_target_effect_context_is_dragon(
     OsrsTargetEffectContext target_context
 ) {
@@ -80,6 +64,37 @@ static inline int osrs_effect_profile_has(
     return (profile->effect_mask & effect_mask) != 0;
 }
 
+#define OSRS_EQUIPMENT_EFFECT_AGGREGATE_FEATURES 10
+
+static inline void osrs_item_effect_class4(uint32_t effect_mask, float out[4]) {
+    uint32_t lifesteal = OSRS_ITEM_EFFECT_BLOOD_FURY | OSRS_ITEM_EFFECT_SANG_HEAL;
+    uint32_t damage_amp = OSRS_ITEM_EFFECT_TWISTED_BOW | OSRS_ITEM_EFFECT_FANG |
+        OSRS_ITEM_EFFECT_TUMEKENS_SHADOW | OSRS_ITEM_EFFECT_DHAROK_PIECE |
+        OSRS_ITEM_EFFECT_DRAGON_HUNTER_WAND | OSRS_ITEM_EFFECT_VENATOR_BOUNCE;
+    uint32_t defensive = OSRS_ITEM_EFFECT_ELYSIAN | OSRS_ITEM_EFFECT_CRYSTAL_ARMOUR |
+        OSRS_ITEM_EFFECT_RECOIL_RING | OSRS_ITEM_EFFECT_VENOM_IMMUNE |
+        OSRS_ITEM_EFFECT_ECHO_BOOTS | OSRS_ITEM_EFFECT_CONFLICTION |
+        OSRS_ITEM_EFFECT_VIRTUS_PIECE;
+    uint32_t util = OSRS_ITEM_EFFECT_LIGHTBEARER;
+    out[0] = (effect_mask & lifesteal)  ? 1.0f : 0.0f;
+    out[1] = (effect_mask & damage_amp) ? 1.0f : 0.0f;
+    out[2] = (effect_mask & defensive)  ? 1.0f : 0.0f;
+    out[3] = (effect_mask & util)       ? 1.0f : 0.0f;
+}
+
+static inline void osrs_write_equipment_effect_aggregate(
+    float* out,
+    const OsrsEquipmentEffectProfile* profile
+) {
+    osrs_item_effect_class4(profile->effect_mask, out);
+    out[4] = (float)profile->virtus_piece_count / 3.0f;
+    out[5] = (float)profile->dharok_piece_count / 4.0f;
+    out[6] = (float)profile->crystal_armour_points / 6.0f;
+    out[7] = profile->recoil_source != OSRS_RECOIL_SOURCE_NONE ? 1.0f : 0.0f;
+    out[8] = profile->spec_regen_mode == OSRS_SPEC_REGEN_MODE_LIGHTBEARER ? 1.0f : 0.0f;
+    out[9] = profile->shield_item != ITEM_NONE ? 1.0f : 0.0f;
+}
+
 static inline OsrsRecoilSource osrs_recoil_source_from_ring(uint8_t ring_item) {
     if (ring_item == ITEM_RING_OF_RECOIL) {
         return OSRS_RECOIL_SOURCE_RING_OF_RECOIL;
@@ -95,6 +110,10 @@ static inline OsrsSpecRegenMode osrs_spec_regen_mode_from_ring(uint8_t ring_item
         return OSRS_SPEC_REGEN_MODE_LIGHTBEARER;
     }
     return OSRS_SPEC_REGEN_MODE_NORMAL;
+}
+
+static inline int osrs_scythe_splats_for_target_size(int target_size) {
+    return target_size >= 3 ? 3 : target_size == 2 ? 2 : 1;
 }
 
 static inline uint8_t osrs_crystal_armour_points(uint8_t item_index) {
@@ -251,11 +270,16 @@ static inline int osrs_confliction_is_match(
            osrs_target_ref_equal(state->confliction_target, target_ref);
 }
 
-static inline OsrsPreparedAttackEffects osrs_prepare_attack_effects(
+static inline int osrs_fang_hit_bound_shrink(int max_hit) {
+    return max_hit * 3 / 20;
+}
+
+static inline OsrsPreparedAttackEffects osrs_prepare_attack_effects_for_melee_style(
     const OsrsEquipmentEffectProfile* profile,
     const OsrsItemEffectState* state,
     uint8_t weapon_item,
     AttackStyle style,
+    MeleeStyle melee_style,
     OsrsMagicAttackKind magic_kind,
     OsrsTargetRef target_ref,
     int is_primary_target,
@@ -268,7 +292,9 @@ static inline OsrsPreparedAttackEffects osrs_prepare_attack_effects(
     OsrsPreparedAttackEffects result = {
         .attack_roll = base_attack_roll,
         .max_hit = base_max_hit,
+        .min_hit = 0,
         .use_double_accuracy = 0,
+        .use_fang_accuracy = 0,
     };
 
     if (style == ATTACK_STYLE_RANGED &&
@@ -308,12 +334,73 @@ static inline OsrsPreparedAttackEffects osrs_prepare_attack_effects(
         result.max_hit = (int)(result.max_hit * (1.0f + hp_ratio * hp_ratio));
     }
 
+    if (style == ATTACK_STYLE_MELEE &&
+        weapon_item == ITEM_OSMUMTENS_FANG &&
+        osrs_effect_profile_has(profile, OSRS_ITEM_EFFECT_FANG)) {
+        int fang_shrink = osrs_fang_hit_bound_shrink(result.max_hit);
+        result.min_hit = fang_shrink;
+        result.max_hit -= fang_shrink;
+        if (melee_style == MELEE_STYLE_STAB) {
+            result.use_fang_accuracy = 1;
+        }
+    }
+
     if (osrs_confliction_can_apply(profile, style, weapon_item, is_primary_target) &&
         osrs_confliction_is_match(state, weapon_item, magic_kind, target_ref)) {
         result.use_double_accuracy = 1;
     }
 
     return result;
+}
+
+static inline OsrsPreparedAttackEffects osrs_prepare_attack_effects(
+    const OsrsEquipmentEffectProfile* profile,
+    const OsrsItemEffectState* state,
+    uint8_t weapon_item,
+    AttackStyle style,
+    OsrsMagicAttackKind magic_kind,
+    OsrsTargetRef target_ref,
+    int is_primary_target,
+    int base_attack_roll,
+    int base_max_hit,
+    OsrsTargetEffectContext target_context,
+    int attacker_current_hitpoints,
+    int attacker_base_hitpoints
+) {
+    return osrs_prepare_attack_effects_for_melee_style(
+        profile, state, weapon_item, style, MELEE_STYLE_STAB, magic_kind,
+        target_ref, is_primary_target, base_attack_roll, base_max_hit,
+        target_context, attacker_current_hitpoints, attacker_base_hitpoints);
+}
+
+static inline int osrs_roll_prepared_attack_damage(
+    const OsrsPreparedAttackEffects* prepared,
+    int def_roll,
+    int splat_max_hit,
+    uint32_t* rng_state
+) {
+    assert(prepared->min_hit <= splat_max_hit);
+    int damage = prepared->min_hit +
+                 encounter_rand_int(rng_state, splat_max_hit - prepared->min_hit + 1);
+    int hit = (prepared->use_fang_accuracy || prepared->use_double_accuracy)
+        ? encounter_roll_hit_chance_double(rng_state, prepared->attack_roll, def_roll)
+        : encounter_roll_hit_chance(rng_state, prepared->attack_roll, def_roll);
+    return hit ? damage : 0;
+}
+
+static inline int osrs_blood_fury_heal_amount(
+    const OsrsEquipmentEffectProfile* profile,
+    AttackStyle style,
+    int damage_dealt,
+    uint32_t* rng_state
+) {
+    if (damage_dealt > 0 &&
+        style == ATTACK_STYLE_MELEE &&
+        osrs_effect_profile_has(profile, OSRS_ITEM_EFFECT_BLOOD_FURY) &&
+        encounter_rand_int(rng_state, 5) == 0) {
+        return damage_dealt * 30 / 100;
+    }
+    return 0;
 }
 
 static inline OsrsPostAttackEffects osrs_finalize_attack_effects(
@@ -462,4 +549,4 @@ static inline void osrs_tick_special_regen(Player* player) {
     }
 }
 
-#endif  // OSRS_ITEM_EFFECTS_H
+#endif

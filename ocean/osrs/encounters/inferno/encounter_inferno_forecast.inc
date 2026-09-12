@@ -1,18 +1,5 @@
 #line 5216 "encounter_inferno.h"
-/* obs layout: player + Zuk phase + pillars + NPC slots + step-out forecast + pending hits + pending Zuk healer sparks */
-#define INF_PLAYER_OBS_SIZE 57
-#define INF_BASE_NPC_OBS_SIZE 415
-#define INF_TOTAL_NPC_OBS_SIZE INF_BASE_NPC_OBS_SIZE
 #define INF_STEP_OUT_FORECAST_HORIZON 4
-#define INF_STEP_OUT_FORECAST_TICK_FEATURES 7
-#define INF_STEP_OUT_FORECAST_ACTION_FEATURES 8
-#define INF_STEP_OUT_FORECAST_OBS_SIZE (ENCOUNTER_MOVE_ACTIONS * INF_STEP_OUT_FORECAST_ACTION_FEATURES)
-#define INF_FEATURES_PER_HIT 5
-#define INF_SPARK_OBS_SLOTS 4
-#define INF_FEATURES_PER_SPARK 5
-#define INF_PENDING_HIT_OBS_SIZE (INF_FEATURES_PER_HIT * ENCOUNTER_MAX_PENDING_HITS)
-#define INF_PENDING_SPARK_OBS_SIZE (INF_FEATURES_PER_SPARK * INF_SPARK_OBS_SLOTS)
-#define INF_NUM_OBS (INF_PLAYER_OBS_SIZE + 12 + INF_TOTAL_NPC_OBS_SIZE + INF_STEP_OUT_FORECAST_OBS_SIZE + INF_PENDING_HIT_OBS_SIZE + INF_PENDING_SPARK_OBS_SIZE)
 
 typedef struct {
     int melee_count;
@@ -38,23 +25,6 @@ typedef struct {
     InfStepOutForecastAction actions[ENCOUNTER_MOVE_ACTIONS];
 } InfStepOutForecast;
 
-/* max hit per NPC type, normalized by mager max (70). for prayer priority obs. */
-static const float INF_NPC_MAX_HIT_NORM[INF_NUM_NPC_TYPES] = {
-    [INF_NPC_NIBBLER]    = 0.0f,
-    [INF_NPC_BAT]        = 19.0f / 70.0f,
-    [INF_NPC_BLOB]       = 29.0f / 70.0f,
-    [INF_NPC_BLOB_MELEE] = 18.0f / 70.0f,
-    [INF_NPC_BLOB_RANGE] = 18.0f / 70.0f,
-    [INF_NPC_BLOB_MAGE]  = 25.0f / 70.0f,
-    [INF_NPC_MELEER]     = 49.0f / 70.0f,
-    [INF_NPC_RANGER]     = 46.0f / 70.0f,
-    [INF_NPC_MAGER]      = 70.0f / 70.0f,
-    [INF_NPC_JAD]        = 113.0f / 70.0f,
-    [INF_NPC_ZUK]        = 148.0f / 70.0f,
-    [INF_NPC_HEALER_JAD] = 13.0f / 70.0f,
-    [INF_NPC_HEALER_ZUK] = 24.0f / 70.0f,
-    [INF_NPC_ZUK_SHIELD] = 0.0f,
-};
 
 static float inf_zuk_attack_timer_obs(const InfernoState* s) {
     if (!inf_is_final_wave(s)) return 0.0f;
@@ -67,8 +37,8 @@ static float inf_zuk_attack_timer_obs(const InfernoState* s) {
         min_timer = timer;
     }
 
-    for (int h = 0; h < s->player_pending_hit_count; h++) {
-        const EncounterPendingHit* hit = &s->player_pending_hits[h];
+    for (int h = 0; h < s->player_pending_hits.count; h++) {
+        const EncounterPendingHit* hit = &s->player_pending_hits.hits[h];
         if (hit->source_npc_type != INF_NPC_ZUK) continue;
         if (hit->ticks_remaining < min_timer)
             min_timer = hit->ticks_remaining;
@@ -82,36 +52,52 @@ static int inf_npc_targets_player_for_obs(const InfernoState* s, const InfNPC* n
     return target.is_player;
 }
 
-static int inf_npc_planned_style_for_obs(const InfNPC* npc) {
-    if (npc->type == INF_NPC_BLOB && npc->blob_scanned_prayer >= 0) {
-        OverheadPrayer scanned = (OverheadPrayer)npc->blob_scanned_prayer;
-        if (scanned == PRAYER_PROTECT_MAGIC) return ATTACK_STYLE_RANGED;
-        if (scanned == PRAYER_PROTECT_RANGED) return ATTACK_STYLE_MAGIC;
-    }
-    if (npc->type == INF_NPC_JAD)
-        return npc->jad_attack_style;
-    return npc->attack_style;
-}
-
-static int inf_step_out_forecast_action_valid(InfernoState* s, int action) {
+static int inf_step_out_forecast_action_valid(
+    const InfernoState* s,
+    const InfernoContext* ctx,
+    int action
+) {
     if (action == 0) return 1;
     int nx = s->player.x + ENCOUNTER_MOVE_TARGET_DX[action];
     int ny = s->player.y + ENCOUNTER_MOVE_TARGET_DY[action];
-    return inf_in_arena(nx, ny) && !inf_blocked_by_pillar(s, nx, ny, 1);
+    return !inf_footprint_blocked_ctx(s, ctx, nx, ny, 1);
 }
 
-static int inf_forecast_style_max_hit(
-    const InfNPCStats* stats, int style
+static void inf_step_out_forecast_action_landing_ctx(
+    const InfernoState* s,
+    const InfernoContext* ctx,
+    int action_idx,
+    Player* moved,
+    int* valid
 ) {
-    if (style == ATTACK_STYLE_NONE) return 0;
-    int max_hit = osrs_npc_max_hit(style,
-        stats->str_level, stats->range_level,
-        stats->melee_str_bonus, stats->ranged_str_bonus,
-        stats->magic_base_dmg, stats->magic_dmg_pct);
-    if (stats->max_hit_cap > 0 && max_hit > stats->max_hit_cap)
-        max_hit = stats->max_hit_cap;
-    return max_hit;
+    *moved = s->player;
+    *valid = inf_step_out_forecast_action_valid(s, ctx, action_idx);
+    if (action_idx == 0) return;
+    InfWalkCtx walk_ctx = { (InfernoState*)s, ctx };
+    encounter_move_to_target(
+        moved,
+        ENCOUNTER_MOVE_TARGET_DX[action_idx],
+        ENCOUNTER_MOVE_TARGET_DY[action_idx],
+        inf_tile_walkable,
+        &walk_ctx);
 }
+
+static Player inf_step_out_forecast_set_action_landing_ctx(
+    const InfernoState* s,
+    const InfernoContext* ctx,
+    int action_idx,
+    InfStepOutForecastAction* action
+) {
+    Player moved;
+    int valid;
+    inf_step_out_forecast_action_landing_ctx(
+        s, ctx, action_idx, &moved, &valid);
+    action->valid = valid;
+    action->land_x = moved.x;
+    action->land_y = moved.y;
+    return moved;
+}
+
 
 static void inf_step_out_forecast_record_style_mask(
     InfStepOutForecastAction* action,
@@ -125,19 +111,19 @@ static void inf_step_out_forecast_record_style_mask(
     int styles = 0;
     if (style_mask & INF_STYLE_MASK_MELEE) {
         tick->melee_count++;
-        int max_hit = inf_forecast_style_max_hit(stats, ATTACK_STYLE_MELEE);
+        int max_hit = inf_npc_style_max_hit(stats, ATTACK_STYLE_MELEE);
         if (max_hit > tick->max_hit) tick->max_hit = max_hit;
         styles++;
     }
     if (style_mask & INF_STYLE_MASK_RANGED) {
         tick->ranged_count++;
-        int max_hit = inf_forecast_style_max_hit(stats, ATTACK_STYLE_RANGED);
+        int max_hit = inf_npc_style_max_hit(stats, ATTACK_STYLE_RANGED);
         if (max_hit > tick->max_hit) tick->max_hit = max_hit;
         styles++;
     }
     if (style_mask & INF_STYLE_MASK_MAGIC) {
         tick->magic_count++;
-        int max_hit = inf_forecast_style_max_hit(stats, ATTACK_STYLE_MAGIC);
+        int max_hit = inf_npc_style_max_hit(stats, ATTACK_STYLE_MAGIC);
         if (max_hit > tick->max_hit) tick->max_hit = max_hit;
         styles++;
     }
@@ -162,12 +148,19 @@ static void inf_step_out_forecast_record_blob_scan(
 
 static int inf_forecast_jad_unknown_style_mask(const InfNPC* npc) {
     if (npc->type != INF_NPC_JAD) return 0;
-    if (npc->jad_attack_style != ATTACK_STYLE_NONE) return 0;
+    if (inf_npc_jad_const(npc)->attack_style != ATTACK_STYLE_NONE) return 0;
     return INF_STYLE_MASK_RANGED | INF_STYLE_MASK_MAGIC;
+}
+
+static AttackStyle inf_forecast_blob_scan_style(OverheadPrayer prayer) {
+    if (prayer == PRAYER_PROTECT_MAGIC) return ATTACK_STYLE_RANGED;
+    if (prayer == PRAYER_PROTECT_RANGED) return ATTACK_STYLE_MAGIC;
+    return ATTACK_STYLE_RANGED;
 }
 
 static void inf_step_out_forecast_npc_attack(
     InfernoState* s,
+    const InfernoContext* ctx,
     int idx,
     InfStepOutForecastAction* action,
     int tick_idx
@@ -185,14 +178,12 @@ static void inf_step_out_forecast_npc_attack(
 
     int has_los_now = 0;
     if (npc->type == INF_NPC_BLOB && stats->attack_range > 1) {
-        has_los_now = inf_npc_has_los(s, idx);
+        has_los_now = inf_npc_has_los_ctx(s, ctx, idx);
         if (npc->blob_scanned_prayer < 0 &&
             has_los_now &&
             !npc->had_los_last_tick) {
             npc->blob_scanned_prayer = (int)s->player.prayer;
-            if (s->player.prayer == PRAYER_PROTECT_MAGIC) npc->attack_style = ATTACK_STYLE_RANGED;
-            else if (s->player.prayer == PRAYER_PROTECT_RANGED) npc->attack_style = ATTACK_STYLE_MAGIC;
-            else npc->attack_style = ATTACK_STYLE_RANGED;
+            npc->attack_style = inf_forecast_blob_scan_style(s->player.prayer);
             npc->had_los_last_tick = has_los_now;
             npc->attack_timer = stats->attack_speed;
             inf_step_out_forecast_record_blob_scan(action, tick_idx);
@@ -203,7 +194,7 @@ static void inf_step_out_forecast_npc_attack(
     if (npc->attack_timer > 0) return;
 
     if (npc->type != INF_NPC_BLOB && stats->attack_range > 1)
-        has_los_now = inf_npc_has_los(s, idx);
+        has_los_now = inf_npc_has_los_ctx(s, ctx, idx);
 
     if (stats->attack_range > 1 &&
         !(npc->type == INF_NPC_BLOB && npc->blob_scanned_prayer >= 0) &&
@@ -212,12 +203,15 @@ static void inf_step_out_forecast_npc_attack(
     int dist = encounter_dist_to_npc(
         s->player.x, s->player.y, npc->x, npc->y, npc->size);
     if (dist == 0 || dist > stats->attack_range) return;
+    if (stats->attack_range == 1 &&
+            !inf_npc_melee_contact_allows_attack_at_tile(
+                s->player.x, s->player.y, npc->type,
+                npc->x, npc->y, npc->size, dist))
+        return;
 
     if (npc->type == INF_NPC_BLOB && npc->blob_scanned_prayer < 0) {
         npc->blob_scanned_prayer = (int)s->player.prayer;
-        if (s->player.prayer == PRAYER_PROTECT_MAGIC) npc->attack_style = ATTACK_STYLE_RANGED;
-        else if (s->player.prayer == PRAYER_PROTECT_RANGED) npc->attack_style = ATTACK_STYLE_MAGIC;
-        else npc->attack_style = ATTACK_STYLE_RANGED;
+        npc->attack_style = inf_forecast_blob_scan_style(s->player.prayer);
         npc->attack_timer = stats->attack_speed;
         inf_step_out_forecast_record_blob_scan(action, tick_idx);
         return;
@@ -225,7 +219,7 @@ static void inf_step_out_forecast_npc_attack(
 
     int style_mask = inf_forecast_jad_unknown_style_mask(npc);
     if (style_mask == 0) {
-        int planned_style = inf_npc_planned_style_for_obs(npc);
+        int planned_style = inf_npc_planned_style_for_current_state(npc);
         if (planned_style == ATTACK_STYLE_NONE) return;
         style_mask = inf_attack_style_options_mask(
             s, npc, stats, planned_style, dist);
@@ -238,13 +232,10 @@ static void inf_step_out_forecast_npc_attack(
     if (npc->type == INF_NPC_BLOB)
         npc->blob_scanned_prayer = -1;
     if (npc->type == INF_NPC_JAD)
-        npc->jad_attack_style = ATTACK_STYLE_NONE;
+        inf_npc_jad(npc)->attack_style = ATTACK_STYLE_NONE;
     npc->attack_timer = stats->attack_speed;
-    if (npc->type == INF_NPC_JAD) {
-        if (s->wave == 66)      npc->attack_timer = 8;
-        else if (s->wave == 67) npc->attack_timer = 9;
-        else                    npc->attack_timer = 8;
-    }
+    if (npc->type == INF_NPC_JAD)
+        npc->attack_timer = inf_jad_attack_timer(s->wave);
 }
 
 static int inf_collect_step_out_forecast_slots(
@@ -274,9 +265,48 @@ static void inf_step_out_forecast_tick(
         if (npc->frozen_ticks > 0) npc->frozen_ticks--;
         if (npc->type == INF_NPC_MAGER && npc->resurrect_cooldown > 0)
             npc->resurrect_cooldown--;
+#ifdef INF_PROFILE_ENABLED
+        int profile_enabled = INF_PROFILE_ENABLED();
+        double move_start = profile_enabled ? INF_PROFILE_NOW_MS() : 0.0;
+#endif
         inf_npc_move_ctx(sim, ctx, i);
-        inf_step_out_forecast_npc_attack(sim, i, action, tick_idx);
+#ifdef INF_PROFILE_ENABLED
+        double attack_start = profile_enabled ? INF_PROFILE_NOW_MS() : 0.0;
+        if (profile_enabled)
+            INF_PROFILE_ADD(INF_PROF_FORECAST_NPC_MOVE, attack_start - move_start);
+#endif
+        inf_step_out_forecast_npc_attack(
+            sim, ctx, i, action, tick_idx);
+#ifdef INF_PROFILE_ENABLED
+        if (profile_enabled)
+            INF_PROFILE_ADD(
+                INF_PROF_FORECAST_NPC_ATTACK,
+                INF_PROFILE_NOW_MS() - attack_start);
+#endif
     }
+}
+
+
+
+static void inf_restore_step_out_forecast_action_state(
+    InfernoState* sim,
+    const InfernoState* s,
+    const int slots[INF_MAX_NPCS],
+    int slot_count,
+    const Player* moved
+) {
+    sim->player.x = moved->x;
+    sim->player.y = moved->y;
+    sim->player.is_running = moved->is_running;
+    for (int slot_idx = 0; slot_idx < slot_count; slot_idx++) {
+        int i = slots[slot_idx];
+        sim->npcs[i] = s->npcs[i];
+    }
+    sim->rng_state = s->rng_state;
+    memcpy(
+        sim->npc_collision_flags,
+        s->npc_collision_flags,
+        sizeof(sim->npc_collision_flags));
 }
 
 static void inf_step_out_forecast_finalize_action(
@@ -311,51 +341,101 @@ static int inf_step_out_forecast_tick_has_event(
         tick->blob_scan_count > 0;
 }
 
+
 static void inf_build_step_out_forecast_ctx(
     const InfernoState* s,
     const InfernoContext* ctx,
     InfStepOutForecast* out
 ) {
+#ifdef INF_PROFILE_ENABLED
+    int inf_prof_enabled = INF_PROFILE_ENABLED();
+    int prof_valid_actions = 0;
+    int prof_distinct_landings = 0;
+    if (inf_prof_enabled)
+        INF_PROFILE_ADD(INF_PROF_FORECAST_CALLS, 1.0);
+#endif
     memset(out, 0, sizeof(*out));
     int forecast_slots[INF_MAX_NPCS];
     int forecast_slot_count = inf_collect_step_out_forecast_slots(
         s, forecast_slots);
+
+    int forecast_has_active_pillar = 0;
+    for (int p = 0; p < INF_NUM_PILLARS; p++) {
+        if (s->pillars[p].active) { forecast_has_active_pillar = 1; break; }
+    }
+#ifdef INF_PROFILE_ENABLED
+    double base_copy_t0 = inf_prof_enabled ? INF_PROFILE_NOW_MS() : 0.0;
+#endif
+    InfernoState sim = *s;
+    InfernoContext forecast_ctx = *ctx;
+#ifdef INF_PROFILE_ENABLED
+    if (inf_prof_enabled) {
+        INF_PROFILE_ADD(
+            INF_PROF_FORECAST_STATE_COPY,
+            INF_PROFILE_NOW_MS() - base_copy_t0);
+    }
+#endif
     for (int action_idx = 0; action_idx < ENCOUNTER_MOVE_ACTIONS; action_idx++) {
         InfStepOutForecastAction* action = &out->actions[action_idx];
-        Player moved = s->player;
-        action->valid = inf_step_out_forecast_action_valid(
-            (InfernoState*)s, action_idx);
-        if (action_idx > 0) {
-            InfWalkCtx walk_ctx = { (InfernoState*)s, ctx };
-            encounter_move_to_target(
-                &moved,
-                ENCOUNTER_MOVE_TARGET_DX[action_idx],
-                ENCOUNTER_MOVE_TARGET_DY[action_idx],
-                inf_tile_walkable,
-                &walk_ctx);
+#ifdef INF_PROFILE_ENABLED
+        double landing_t0 = inf_prof_enabled ? INF_PROFILE_NOW_MS() : 0.0;
+#endif
+        inf_reset_npc_player_los_frame(&forecast_ctx);
+        Player moved = inf_step_out_forecast_set_action_landing_ctx(
+            s, &forecast_ctx, action_idx, action);
+#ifdef INF_PROFILE_ENABLED
+        if (inf_prof_enabled) {
+            INF_PROFILE_ADD(
+                INF_PROF_FORECAST_LANDING,
+                INF_PROFILE_NOW_MS() - landing_t0);
+            if (action->valid) {
+                prof_valid_actions++;
+                int duplicate_landing = 0;
+                for (int prior_idx = 0; prior_idx < action_idx; prior_idx++) {
+                    const InfStepOutForecastAction* prior =
+                        &out->actions[prior_idx];
+                    if (prior->valid &&
+                            prior->land_x == action->land_x &&
+                            prior->land_y == action->land_y) {
+                        duplicate_landing = 1;
+                        break;
+                    }
+                }
+                if (!duplicate_landing)
+                    prof_distinct_landings++;
+            }
         }
-        action->land_x = moved.x;
-        action->land_y = moved.y;
+#endif
         if (!action->valid || forecast_slot_count == 0) continue;
+        if (!forecast_has_active_pillar) continue;
 
-        InfernoState sim = *s;
-        sim.player.x = moved.x;
-        sim.player.y = moved.y;
-        sim.player.is_running = moved.is_running;
-        inf_invalidate_los_cache(&sim);
-        inf_rebuild_player_collision_flags(&sim);
-
-        for (int tick_idx = 0; tick_idx < INF_STEP_OUT_FORECAST_HORIZON; tick_idx++) {
-            inf_step_out_forecast_tick(
-                &sim, ctx, action, tick_idx, forecast_slots, forecast_slot_count);
+#ifdef INF_PROFILE_ENABLED
+        double state_copy_t0 = inf_prof_enabled ? INF_PROFILE_NOW_MS() : 0.0;
+#endif
+        inf_restore_step_out_forecast_action_state(
+            &sim, s, forecast_slots, forecast_slot_count, &moved);
+#ifdef INF_PROFILE_ENABLED
+        if (inf_prof_enabled) {
+            INF_PROFILE_ADD(
+                INF_PROF_FORECAST_STATE_COPY,
+                INF_PROFILE_NOW_MS() - state_copy_t0);
         }
+#endif
+
+        for (int tick_idx = 0; tick_idx < INF_STEP_OUT_FORECAST_HORIZON; tick_idx++)
+            inf_step_out_forecast_tick(
+                &sim, &forecast_ctx, action, tick_idx,
+                forecast_slots, forecast_slot_count);
         inf_step_out_forecast_finalize_action(action);
     }
-}
-
-static void inf_build_step_out_forecast(
-    const InfernoState* s,
-    InfStepOutForecast* out
-) {
-    inf_build_step_out_forecast_ctx(s, inf_legacy_context(), out);
+#ifdef INF_PROFILE_ENABLED
+    if (inf_prof_enabled) {
+        INF_PROFILE_ADD(
+            INF_PROF_FORECAST_VALID_ACTIONS,
+            (double)prof_valid_actions);
+        INF_PROFILE_ADD(
+            INF_PROF_FORECAST_DISTINCT_LANDINGS,
+            (double)prof_distinct_landings);
+    }
+#endif
 }

@@ -1,23 +1,63 @@
-/**
- * @file osrs_interaction.h
- * @brief shared entity interaction system + spec toggle helpers.
- *
- * in real OSRS, clicking to attack an entity starts a persistent interaction
- * that auto-walks + auto-attacks until explicitly interrupted.
- *
- * ref: OSRS reverse engineering docs "Entity Interactions"
- * interrupts: ground click, inventory item actions (food/potion/gear)
- * NOT interrupts: prayer toggle, spec toggle, interface clicks, delays
- */
-
 #ifndef OSRS_INTERACTION_H
 #define OSRS_INTERACTION_H
 
+#include <assert.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+#define OSRS_INTERACTION_ROUTE_MAX_WAYPOINTS 25
+
+typedef enum {
+    OSRS_INTERACTION_ROUTE_EMPTY = 0,
+    OSRS_INTERACTION_ROUTE_READY,
+    OSRS_INTERACTION_ROUTE_FAILED,
+} OsrsInteractionRouteState;
 
 typedef struct {
-    int target_slot;    /* target entity slot index, -1 = no interaction */
+    OsrsInteractionRouteState state;
+    uint64_t topology_revision;
+    uint64_t blocker_revision;
+    int actor_size;
+    uint8_t movement_mode;
+    uint8_t cost_policy;
+    int target_x;
+    int target_y;
+    int target_size;
+    int attack_range;
+    int planned_source_x;
+    int planned_source_y;
+    int expected_player_x;
+    int expected_player_y;
+    int waypoint_count;
+    int waypoint_index;
+    int waypoint_x[OSRS_INTERACTION_ROUTE_MAX_WAYPOINTS];
+    int waypoint_y[OSRS_INTERACTION_ROUTE_MAX_WAYPOINTS];
+} OsrsActorRouteCache;
+
+#define OSRS_INTERACTION_SERIALIZED_ROUTE_BYTES 244
+
+typedef struct {
+    int target_slot;
+    uint8_t serialized_route_padding[OSRS_INTERACTION_SERIALIZED_ROUTE_BYTES];
 } OsrsInteraction;
 
+static_assert(sizeof(OsrsInteraction) == 248, "OsrsInteraction serialized layout");
+static_assert(offsetof(OsrsInteraction, target_slot) == 0, "OsrsInteraction target offset");
+static_assert(offsetof(OsrsInteraction, serialized_route_padding) == 4,
+    "OsrsInteraction reserved route offset");
+
+static inline void osrs_interaction_zero_serialized_route_padding(
+    OsrsInteraction* ix
+) {
+    memset(ix->serialized_route_padding, 0, sizeof(ix->serialized_route_padding));
+}
+
+static inline void osrs_actor_route_cache_clear(OsrsActorRouteCache* route) {
+    route->state = OSRS_INTERACTION_ROUTE_EMPTY;
+    route->waypoint_count = 0;
+    route->waypoint_index = 0;
+}
 
 static inline void osrs_interaction_set(OsrsInteraction* ix, int target_slot) {
     ix->target_slot = target_slot;
@@ -26,29 +66,24 @@ static inline void osrs_interaction_set(OsrsInteraction* ix, int target_slot) {
 static inline void osrs_interaction_clear(OsrsInteraction* ix) {
     ix->target_slot = -1;
 }
-
 static inline int osrs_interaction_active(const OsrsInteraction* ix) {
     return ix->target_slot >= 0;
 }
 
 static inline void osrs_interaction_init(OsrsInteraction* ix) {
     ix->target_slot = -1;
+    osrs_interaction_zero_serialized_route_padding(ix);
 }
 
+#define OSRS_IACT_NONE     0
+#define OSRS_IACT_MOVE     1
+#define OSRS_IACT_EAT      2
+#define OSRS_IACT_DRINK    3
+#define OSRS_IACT_EQUIP    4
+#define OSRS_IACT_PRAYER   5
+#define OSRS_IACT_SPEC     6
+#define OSRS_IACT_ATTACK   7
 
-#define OSRS_IACT_NONE     0  /* no action / idle — does NOT interrupt */
-#define OSRS_IACT_MOVE     1  /* explicit ground click — INTERRUPTS */
-#define OSRS_IACT_EAT      2  /* eat food from inventory — INTERRUPTS */
-#define OSRS_IACT_DRINK    3  /* drink potion from inventory — INTERRUPTS */
-#define OSRS_IACT_EQUIP    4  /* equip/switch gear from inventory — INTERRUPTS */
-#define OSRS_IACT_PRAYER   5  /* prayer toggle — does NOT interrupt */
-#define OSRS_IACT_SPEC     6  /* spec toggle — does NOT interrupt */
-#define OSRS_IACT_ATTACK   7  /* click to attack entity — SETS new interaction (not an interrupt) */
-
-
-/* check if an action type interrupts the current interaction.
-   if it does, clears the interaction and returns 1. otherwise returns 0.
-   ATTACK is handled separately (it sets a new interaction, not an interrupt). */
 static inline int osrs_interaction_check_interrupt(OsrsInteraction* ix, int action_type) {
     switch (action_type) {
         case OSRS_IACT_MOVE:
@@ -66,17 +101,8 @@ static inline int osrs_interaction_check_interrupt(OsrsInteraction* ix, int acti
     }
 }
 
-
-/* spec toggle: arm/disarm special attack.
-   in real OSRS: clicking the spec orb toggles spec_armed.
-   when attack fires with spec_armed=1, weapon spec is used and spec_armed auto-disarms.
-   spec toggle does NOT interrupt entity interactions. */
-static inline void osrs_spec_toggle(int* spec_armed) {
-    *spec_armed = !(*spec_armed);
-}
-
 static inline void osrs_spec_disarm(int* spec_armed) {
     *spec_armed = 0;
 }
 
-#endif /* OSRS_INTERACTION_H */
+#endif
